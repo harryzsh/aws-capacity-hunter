@@ -216,6 +216,112 @@ python3 grab_odcr.py \
 
 ---
 
+## ASG 接预留配置（客户侧必读）
+
+脚本只负责**把预留抢到手**。预留抢到后，能不能被你的 Auto Scaling Group（ASG）自动「吃掉」、扩容时实例真正落进预留，**取决于客户侧的 ASG 配置**。这一节是开 ASG 前客户必须确认的事项。
+
+### 核心开关：`capacity-reservations-first`
+
+在 ASG 上设置 Capacity Reservation 偏好（**设在 ASG 上，不是启动模板上**）：
+
+```bash
+aws autoscaling create-auto-scaling-group \
+  --auto-scaling-group-name <你的ASG名> \
+  --launch-template "LaunchTemplateId=<LT-ID>,Version=\$Latest" \
+  --vpc-zone-identifier "<1b子网>,<1d子网>" \
+  --capacity-reservation-specification "CapacityReservationPreference=capacity-reservations-first" \
+  ...
+
+# 已有 ASG 改配置：
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name <你的ASG名> \
+  --capacity-reservation-specification "CapacityReservationPreference=capacity-reservations-first"
+```
+
+| 偏好值 | 行为 | 适用 |
+|--------|------|------|
+| `capacity-reservations-first` | **优先**用匹配的 open 预留，预留用光了**自动回落到普通 On-Demand**（软兜底，不会扩容失败） | ⭐ Prime Day 推荐：有预留就吃，没预留也不挂 |
+| `capacity-reservations-only` | 只用预留，没预留就**扩容失败** | 太硬，不推荐（预留不够时实例起不来） |
+| `none` / `default` | 不主动用预留 | 不适用 |
+
+> 用 `capacity-reservations-first` + `open` 模式预留：ASG **不需要**指定具体预留 ID，任何属性匹配的实例都会自动掉进预留。这就是为什么 `grab_odcr.py` 默认建 `open` 预留——客户 ASG 零改动即可吸纳。
+
+### 实例要落进预留，4 个属性必须 100% 对齐
+
+预留和 ASG 启动的实例，下面 4 项**少一项对不上，实例就掉不进预留**（会静默走普通 On-Demand）：
+
+| 属性 | 必须一致 | 本次配置 |
+|------|----------|----------|
+| **机型** instance type | 预留机型 = LT 机型 | `i4i.16xlarge` |
+| **平台** platform (OS) | 预留 platform = 实例 OS | `Linux/UNIX`（AL2023） |
+| **可用区** AZ | 预留 AZ ∈ ASG 子网所在 AZ | `us-east-1b` / `us-east-1d` |
+| **租户** tenancy | 预留 tenancy = 实例 tenancy | `default`（共享） |
+
+### 客户开 ASG 前 checklist
+
+- [ ] ASG 设了 `CapacityReservationPreference=capacity-reservations-first`
+- [ ] ASG 的 `--vpc-zone-identifier` 横跨预留所在的两个 AZ（1b + 1d），且每个 AZ 都有可用子网
+- [ ] 启动模板的机型 = 预留机型（`i4i.16xlarge`）
+- [ ] 启动模板的 AMI 架构 = 机型架构（i4i 是 x86_64，别配成 ARM AMI）
+- [ ] 启动模板平台 = `Linux/UNIX`，tenancy = `default`
+- [ ] 预留是 `open` 模式（`grab_odcr.py` 默认就是，无需 ASG 指定预留 ID）
+
+### ⚠️ 常见坑
+
+- **属性对不上 = 双倍计费**：实例掉不进预留时不会报错，而是静默起一台普通 On-Demand。结果你**同时付**空转预留的钱 + On-Demand 实例的钱。开 ASG 前务必核对上面 4 个属性。
+- **AMI 架构不匹配**：i4i 是 Intel x86_64，启动模板若配了 ARM/Graviton 的 AMI，实例根本起不来。
+- **预留用了 `targeted` 而非 `open`**：targeted 模式要求实例显式指定预留 ID，ASG 不会自动吸纳。本脚本默认 `open`，不要改成 targeted。
+- **ASG 50/50 调度 vs 预留分布**：ASG 默认往实例数少的 AZ 放，最终≈50/50。所以预留也要 50/50 均衡铺（用 `--per-az-cores`），否则多的那边预留空转、少的那边缺口落到 On-Demand。
+
+---
+
+## Smoke Test 验证报告
+
+为了在真金白银抢 i4i 之前，先确认「**open 预留 + ASG `capacity-reservations-first` → 实例自动落进预留**」这套机制确实成立，跑了一次端到端 smoke test。
+
+### 关键设计决策：用 t3.micro，不用 i4i.16xlarge
+
+| 维度 | 说明 |
+|------|------|
+| **验证目标** | 验的是 ASG 吃预留的**机制**，不是 i4i 容量本身 |
+| **为什么换机型** | `capacity-reservations-first` 的匹配逻辑**与机型无关**——对 t3.micro 成立，对 i4i.16xlarge 必然同样成立 |
+| **成本** | t3.micro 2 台 + 2 个预留跑几分钟，全程 **< $0.05**；i4i.16xlarge 2 台约 $11/小时，且本来就可能抢不到容量，反而干扰结论 |
+| **容量** | t3.micro 容量稳拿，不会卡在「抢不到」上，确保测的是机制而非运气 |
+
+> ⚠️ 注意区分：本测试证明的是**机制链路**。Prime Day 真跑 i4i 时，能不能**抢到** i4i 预留是另一回事（取决于 AWS 池子有无货，靠 `grab_odcr.py --watch` 死等解决）。但只要预留抢到了，ASG 一定能把它吃进去——这一点已实锤。
+
+### 测试步骤（我实际做的）
+
+环境：`us-east-1`，账户 `476114114317`，默认 VPC（`vpc-02f8...52d0`，原本只有 1c 一个子网）。所有资源打 `purpose=primeday-smoke-test` 标签，便于一键拆除。
+
+1. **建子网**：默认 VPC 在 1b/1d 没子网，临时各建一个（`172.31.16.0/20`@1b、`172.31.32.0/20`@1d）。
+2. **建 open 预留**：在 1b、1d 各建 1 个 `t3.micro` 容量预留，`platform=Linux/UNIX`、`tenancy=default`、`instance-match-criteria=open`（与生产 ODCR 同模式）。
+3. **建启动模板**：AL2023 AMI（x86_64）、`t3.micro`、默认 SG。
+4. **建 ASG**：横跨两个子网，`min=0 / max=2 / desired=0`，`CapacityReservationPreference=capacity-reservations-first`。
+5. **记录基线**：两个预留 `Available=1`、未使用。
+6. **触发扩容**：`set-desired-capacity --desired-capacity 2`，等约 90 秒实例起来。
+7. **双向取证**（见下）。
+8. **拆除**：删 ASG（force，连带终止实例）→ 取消两个预留（停计费）→ 删启动模板 → 删游离 ENI → 删两个子网。
+
+### 结果：✅ 通过
+
+两侧证据对得上，机制确认无误：
+
+| 视角 | us-east-1b | us-east-1d |
+|------|-----------|-----------|
+| 实例的 `CapacityReservationId` | → `cr-…aa28` ✓ | → `cr-…459` ✓ |
+| 预留 `Available`（扩容前 → 后） | 1 → **0** | 1 → **0** |
+
+- **实例侧**：两台实例的 `CapacityReservationId` 字段直接写着对应 AZ 的预留 ID——实例自己记录了它落进了哪个预留。
+- **预留侧**：两个预留的可用槽位同步从 1 掉到 **0**，证明槽位被实例占满。
+- > 小注：CLI 表格里 `UsedInstanceCount` 字段渲染成 `null`/`None` 是 API 的显示怪癖，但 `Total(1) − Available(0) = 1` 在数学上就是「被占用 1 个」，结论不受影响。
+
+### 清理结果：零残留
+
+拆除后扫描 5 类资源（实例 / 预留 / 启动模板 / ASG / 子网），**全部为空**，无任何持续计费资源遗留。子网首次删除时因实例刚终止、ENI 未释放报 `DependencyViolation`，等 ENI 被 AWS 自动回收后重删成功——这是正常的资源释放时序。
+
+---
+
 ## 24×7 死等模式（`--watch`）
 
 产能不是一直有的，AWS 会**间歇性**地把回收的 i4i 放回池子——可能凌晨某几分钟突然有一批，几秒后又被别人抢光。
