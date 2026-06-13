@@ -96,6 +96,8 @@ python3 grab_ondemand.py --terminate-tagged --live
 | `--target-cores N` | 抢够 N 个 vCPU 就停下 | `8` | `--target-cores 10000` |
 | `--types ...` | 自定义机型优先级，按你写的顺序抢（可混 i4g 兜底） | 内置大机型优先 | `--types i4i.4xlarge i4i.2xlarge i4g.4xlarge` |
 | `--live` | 真正启实例。**不加 = 只演练不启** | 关闭（演练） | `--live` |
+| `--watch` | 24×7 死等模式：循环重扫，直到抢够 `--target-cores` 才停（产能是间歇放出来的，盯着才抢得到） | 关闭（扫一遍就退出） | `--watch` |
+| `--interval N` | `--watch` 模式下每轮之间隔几秒 | `60` | `--interval 30` |
 | `--terminate-tagged` | 一键终止本脚本启的所有实例（清理用） | 关闭 | `--terminate-tagged --live` |
 | `-h` / `--help` | 显示帮助 | — | `--help` |
 
@@ -135,6 +137,8 @@ python3 grab_odcr.py --cancel-all --live
 | `--types ...` | 自定义机型优先级，按你写的顺序抢 | 内置大机型优先 | `--types i4i.4xlarge i4i.2xlarge` |
 | `--end-hours N` | N 小时后预留**自动过期释放**（计费保险，防止忘关） | 不过期，直到手动取消 | `--end-hours 6` |
 | `--live` | 真正建预留。**不加 = 只演练不建**。⚠️ 加了立刻计费 | 关闭（演练） | `--live` |
+| `--watch` | 24×7 死等模式：循环重扫，直到预留够 `--target-cores` 才停 | 关闭（扫一遍就退出） | `--watch` |
+| `--interval N` | `--watch` 模式下每轮之间隔几秒 | `60` | `--interval 30` |
 | `--cancel-all` | 取消所有预留、**停止计费**（清理用） | 关闭 | `--cancel-all --live` |
 | `--list` | 只查看当前持有的预留，不增不删 | 关闭 | `--list` |
 | `-h` / `--help` | 显示帮助 | — | `--help` |
@@ -179,13 +183,65 @@ python3 grab_odcr.py --cancel-all --live
 
 ---
 
+## 24×7 死等模式（`--watch`）
+
+产能不是一直有的，AWS 会**间歇性**地把回收的 i4i 放回池子——可能凌晨某几分钟突然有一批，几秒后又被别人抢光。
+单次扫描很可能空手而归。`--watch` 让脚本**循环重扫**，每隔 `--interval` 秒再扫一遍，直到抢够 `--target-cores` 才停，这才是真正能把产能攒起来的用法。
+
+```bash
+# On-Demand：每 30 秒重扫一次，死等到凑够 10000 vCPU
+python3 grab_ondemand.py --target-cores 10000 --live --watch --interval 30
+
+# ODCR：同理，配合 --end-hours 做计费保险
+python3 grab_odcr.py --target-cores 10000 --live --watch --interval 30 --end-hours 6
+```
+
+- 已抢到的会累加，每轮只补差额，不会重复抢。
+- `Ctrl-C` 随时安全退出，已抢到的资源不受影响（已记在日志和台账里）。
+- 适合挂在 `tmux` / `screen` / `nohup` 里长期跑，或交给 systemd / cron 托管。
+
+---
+
+## 日志与抢占台账
+
+脚本会把每一轮运行**全程记录到日志**，无需任何开关、零外部依赖，全部落在本地 `logs/` 目录：
+
+| 文件 | 内容 | 格式 |
+|------|------|------|
+| `logs/grab_ondemand.log` / `logs/grab_odcr.log` | 人读的完整运行流水：每轮扫了哪些 AZ/机型、抢到/没抢到、限流退避等 | 文本，自动轮转（单文件 5 MB，保留 5 份，绝不撑爆磁盘） |
+| `logs/grabs.jsonl` | **抢占台账**：每真正抢到一台就追加一行 JSON，方便事后统计、对账、喂给其他工具 | JSON Lines（一行一条） |
+
+`grabs.jsonl` 每行的字段：
+
+```json
+{"ts": "2026-06-13T07:12:16Z", "via": "ondemand", "instance_type": "i4i.8xlarge",
+ "az": "us-east-1a", "region": "us-east-1", "vcpu": 32, "total_vcpu": 32, "target_vcpu": 10000}
+```
+
+| 字段 | 含义 |
+|------|------|
+| `ts` | 抢到时刻（UTC ISO8601） |
+| `via` | 路线：`ondemand` 或 `odcr` |
+| `instance_type` | 抢到的机型 |
+| `az` | 落在哪个可用区 |
+| `region` | 区域 |
+| `vcpu` | 这一台贡献的 vCPU |
+| `total_vcpu` | 累计已抢到的 vCPU |
+| `target_vcpu` | 本次目标 vCPU |
+
+> **演练（dry-run）不写台账**——`grabs.jsonl` 里只会有真正计费的抢占记录，干净可审计。
+> 想看当前进度：`tail -f logs/grab_ondemand.log`；想统计抢到多少台：`wc -l logs/grabs.jsonl`。
+
+---
+
 ## 文件结构
 
 ```
 .
-├── common.py          # 共享工具：AZ/子网发现、机型 offering 探测、退避重试、vCPU 计数、错误分类
+├── common.py          # 共享工具：AZ/子网发现、机型 offering 探测、退避重试、vCPU 计数、错误分类、日志与台账
 ├── grab_ondemand.py   # On-Demand 抢占脚本
 ├── grab_odcr.py       # ODCR 预留抢占脚本
+├── logs/              # 运行日志（自动轮转）+ 抢占台账 grabs.jsonl（首次运行自动生成）
 ├── requirements.txt   # 依赖（boto3）
 └── README.md
 ```

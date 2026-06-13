@@ -3,14 +3,23 @@
 Both grab_ondemand.py and grab_odcr.py import from here.
 Region is configurable via --region (default: us-east-1).
 """
+import os
+import json
 import time
 import random
 import logging
+import datetime
+from logging.handlers import RotatingFileHandler
 
 import boto3
 from botocore.exceptions import ClientError
 
 DEFAULT_REGION = "us-east-1"
+
+# All logs/ledgers live next to the scripts, regardless of cwd.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+GRAB_LEDGER = os.path.join(LOGS_DIR, "grabs.jsonl")
 
 # vCPU per i4i size — used to count progress toward the core target.
 VCPU = {
@@ -56,13 +65,55 @@ THROTTLE_ERRORS = {"RequestLimitExceeded", "Throttling", "ThrottlingException"}
 DRYRUN_OK = "DryRunOperation"
 
 
-def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-5s %(message)s",
-        datefmt="%H:%M:%S",
+def setup_logging(logfile=None):
+    """Console + (optional) rotating file logger.
+
+    logfile: base name like 'grab_odcr.log'. Written under logs/ with
+             rotation (5 MB x 5 backups) so it never fills the disk.
+    """
+    logger = logging.getLogger("i4i-grab")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-5s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
-    return logging.getLogger("i4i-grab")
+    # console
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    # rotating file
+    if logfile:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        fh = RotatingFileHandler(
+            os.path.join(LOGS_DIR, logfile),
+            maxBytes=5 * 1024 * 1024, backupCount=5,
+        )
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    return logger
+
+
+def record_grab(via, itype, az, vcpu, total, target, region, dry_run):
+    """Append one JSON line to the ledger every time we secure capacity.
+
+    Machine-readable feed for downstream tooling (parsers, dashboards, etc.).
+    Skipped during dry-run so the ledger only ever holds real grabs.
+    """
+    if dry_run:
+        return
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    rec = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "via": via,                # "ondemand" | "odcr"
+        "instance_type": itype,
+        "az": az,
+        "region": region,
+        "vcpu": vcpu,
+        "total_vcpu": total,
+        "target_vcpu": target,
+    }
+    with open(GRAB_LEDGER, "a") as f:
+        f.write(json.dumps(rec) + "\n")
 
 
 def ec2_client(region=DEFAULT_REGION):
