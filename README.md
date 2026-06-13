@@ -277,7 +277,8 @@ aws autoscaling update-auto-scaling-group \
 
 ## EKS 自建节点组（self-managed node group）专项
 
-> 本节针对客户场景：ASG 是**客户自建的 EKS 节点组**，上面跑 Kubernetes。EC2 层抢货机制不变（已 Smoke Test 验证），但 Kubernetes 层叠加了新风险——尤其有 3 个会**悄悄把抢到的 i4i 还回 AWS**。
+> 本节针对客户实际架构：**EKS 自建节点组**，**自管 auto scaler**（非 Kubernetes Cluster Autoscaler），**每个 AZ 一个 ASG**。
+> 这套架构天然规避了原本 6 个坑里的 2 个（AZRebalance、跨 AZ 调度）。EC2 层抢货机制不变（已 Smoke Test 验证），剩下的 Kubernetes 层风险**收敛到一条**：自管 scaler 在低负载时把节点缩下去，把抢到的 i4i 还回 AWS。
 
 ### 本脚本的定位：只抢预留，绝不碰 ASG（写死）
 
@@ -309,47 +310,59 @@ python3 grab_odcr.py --cancel-all --live
 
 抢到的预留即 `open` 模式，客户节点组的 ASG 自动吸纳，脚本无需也不会触碰 ASG。
 
-### 🔴 三个「会悄悄把抢到的货还回去」的致命坑
+### ✅ 客户架构已规避的两个坑
 
-抢到 i4i 不等于守得住——下面 3 个 Kubernetes 层机制会在你没填满 pod 时主动终止节点，把容量还回 AWS，高峰**可能抢不回**。**抢货前必须先关掉它们。**
+| 原坑 | 为什么本架构下不成立 |
+|------|----------------------|
+| **AZRebalance**（单 ASG 跨多 AZ 时会搬实例丢容量）| AZRebalance 只在**单 ASG 横跨多 AZ**时触发。客户**每 AZ 一个 ASG**（单 AZ），组内没有可均衡对象 → 不触发。前提：每个 ASG 只挂**单 AZ 的子网**（务必确认，见下方 checklist）|
+| **跨 AZ 单节点组**（CA 无法精确控制 AZ 落点）| 客户已经是**每 AZ 一个 ASG**，正好对齐脚本 `--per-az-cores` 的均衡抢货设计 → 已解决 |
 
-| # | 坑 | 后果 | 防护手段 |
-|---|----|------|----------|
-| 1 | **Cluster Autoscaler 缩容** | CA 按节点利用率缩容，pod 没填满就判定「利用率低」主动终止节点，抢到的预留节点被回收 | 给节点打注解 `cluster-autoscaler.kubernetes.io/scale-down-disabled=true`；并把 ASG `min = desired = 预留数` 钉死 |
-| 2 | **AZRebalance** | 自建 ASG **不会自动挂起**此进程，它为均衡 AZ 会先终止节点再重启，抢不到货时净丢容量 | `aws autoscaling suspend-processes --auto-scaling-group-name <asg> --scaling-processes AZRebalance` |
-| 3 | **CA 不会主动占满预留** | CA 是 pending-pod 驱动的，没等待调度的 pod 就不起节点——你照付 ODCR 全额却跑空 | 大促前主动预热：拉高 ASG `min/desired` 强制起节点占预留，别指望 CA 自己填 |
+> 注：客户用**自管 auto scaler**，不是 Kubernetes Cluster Autoscaler，所以原「CA 缩容 / CA 不占满预留」两个坑也不以 CA 形态出现——但风险换了个马甲，见下。
+
+### 🔴 真正剩下的核心坑：自管 scaler 低负载缩容
+
+抢到 i4i 不等于守得住。客户自管 scaler 若有「节点利用率低 → 缩容」逻辑，会在 pod 没填满时主动终止节点，把容量还回 AWS，高峰**可能抢不回**。
+
+| 后果 | 防护手段（二选一，推荐都做）|
+|------|------|
+| scaler 判定低负载，缩掉抢到的预留节点 | **① 大促窗口把每个 ASG 的 `min = desired = 该 AZ 预留数` 钉死**，关掉向下缩容逻辑——这是最干净的做法，坑直接消除 |
+| 预留抢到了但没 pod 调度，节点不起，ODCR 空转全额计费 | **② 大促前主动预热**：直接拉高 `min/desired` 强制起节点占满预留，别等 scaler |
 
 ```bash
-# 坑 1：禁止 CA 缩容（逐节点）
-kubectl annotate node <node> cluster-autoscaler.kubernetes.io/scale-down-disabled=true
-
-# 坑 2：挂起 AZRebalance（每个单 AZ 节点组都要做）
-aws autoscaling suspend-processes \
-  --auto-scaling-group-name <你的节点组ASG名> \
-  --scaling-processes AZRebalance
+# 钉死下限（每个单 AZ ASG 各做一次，N = 该 AZ 预留数）
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name <该AZ的ASG名> \
+  --min-size <N> --desired-capacity <N> --max-size <N>
 ```
 
-### 🟡 三个「配置不对就用不上预留」的坑
+> ✅ **这是现在唯一需要跟客户在 K8s 层敲死的事**：大促期间能否把两个 ASG 的 `min/desired` 钉到预留数、关掉向下缩容。
 
-| # | 坑 | 说明 | 正确做法 |
-|---|----|------|----------|
-| 4 | **跨 AZ 单节点组** | CA 把同组节点视为等价，无法精确控制 AZ 落点 | 1b / 1d **拆成两个单 AZ 节点组**（正契合脚本 `--per-az-cores` 均衡设计）|
-| 5 | **实例类型没锁死** | 启动模板配多机型，open 预留四要素匹配不上，静默走普通 On-Demand | 启动模板**只配 `i4i.16xlarge`**，别配多实例类型 |
-| 6 | **大促期间滚动更新 / 改 LT 版本** | 改启动模板版本会 recycle 所有节点，抢不到货时可能丢容量 | 配置**冻结**到大促结束，期间禁止改 LT、禁止滚动更新 |
+### 🟡 两个「配置不对就用不上预留」的坑
+
+| 坑 | 说明 | 正确做法 |
+|----|------|----------|
+| **实例类型没锁死** | 启动模板配多机型，open 预留四要素匹配不上，静默走普通 On-Demand | 启动模板**只配 `i4i.16xlarge`**，别配多实例类型 |
+| **大促期间滚动更新 / 改 LT 版本** | 改启动模板版本会 recycle 所有节点，抢不到货时可能丢容量 | 配置**冻结**到大促结束，期间禁止改 LT、禁止滚动更新 |
 
 ### EKS 自建节点组 checklist（抢货前）
 
-- [ ] 节点组**每 AZ 一个**（1b 一个、1d 一个），不要跨 AZ
-- [ ] 每个节点组 ASG 设了 `CapacityReservationPreference=capacity-reservations-first`
-- [ ] 每个节点组 ASG 已 `suspend-processes AZRebalance`
-- [ ] Cluster Autoscaler 缩容已禁（注解 `scale-down-disabled=true` 或 ASG 标签）
+EC2 层硬阻塞（错一个整个方案归零，**最优先**）：
+
+- [ ] **抢预留的账号 = EKS 集群账号**（open 预留只在同账号内匹配；Smoke Test 在 `476114114317`）
+- [ ] **该账号 On-Demand Standard vCPU 配额已提到 ≥10000**（156 台 = 9984 vCPU，默认配额远不够 → 提早开 quota 工单，**头号硬阻塞**）
+- [ ] **两个 ASG 的子网确实在 1b + 1d**（不在则改抢对应 AZ）
 - [ ] 启动模板只锁 `i4i.16xlarge`、`Linux/UNIX`、`default` 租户、x86_64 AMI
+
+客户侧配置：
+
+- [ ] 每个 ASG 设了 `CapacityReservationPreference=capacity-reservations-first`
+- [ ] 每个 ASG 只挂**单 AZ 子网**（确认 AZRebalance 确实不触发；可顺手 `suspend-processes AZRebalance` 防配置漂移，零成本）
+- [ ] **大促窗口把每个 ASG `min/desired` 钉到该 AZ 预留数，关掉自管 scaler 的向下缩容**
 - [ ] 实例打了 `kubernetes.io/cluster/<集群名>: owned` 标签（否则节点不入集群）
 - [ ] 关键 pod 配了 PodDisruptionBudget（进一步防误驱逐）
-- [ ] 大促前已把 ASG `min/desired` 拉到等于预留数，主动预热占满
 - [ ] 配置已冻结，大促期间不改 LT、不滚动更新
 
-> **一句话总结**：EC2 层抢货（ODCR + `capacity-reservations-first`）已验证没问题；新增风险全在 Kubernetes 层会「自动还货」——**Cluster Autoscaler 和 AZRebalance 是头号敌人，必须先关掉它们再抢**。本脚本只负责抢预留，对客户 ASG 零触碰。
+> **一句话总结**：客户这套「自管 scaler + 每 AZ 一个 ASG」天然规避了 AZRebalance 和跨 AZ 调度两个坑；K8s 层只剩一件事——**大促期间钉死 `min/desired`、别向下缩容**。真正的拦路虎在 EC2 层：**账号对齐 + vCPU 配额**。本脚本只负责抢预留，对客户 ASG 零触碰。
 
 ---
 
