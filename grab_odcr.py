@@ -121,11 +121,15 @@ def held_cores_by_az(client):
     return held
 
 
-def print_list(client):
+def print_list(client, target_cores=None, per_az_cores=None):
     """--list: show every tagged reservation, then a per-AZ + total summary.
 
     The summary answers the two questions you actually have during a grab:
     "how many cores do I hold total?" and "how is it split across AZs?"
+
+    If you ALSO pass --target-cores / --per-az-cores to --list, the summary
+    shows held/target progress and a FULL/short flag, so you can see at a
+    glance how close you are without doing the math.
     """
     rows = list_reservations(client)
     if not rows:
@@ -140,10 +144,22 @@ def print_list(client):
         v16 = VCPU["i4i.16xlarge"]
         log.info("--- summary (tag=%s) ---", TAG_VAL)
         for az in sorted(held):
-            log.info("  %-12s %5d vCPU  (%d x i4i.16xlarge)",
-                     az, held[az], held[az] // v16)
-        log.info("  %-12s %5d vCPU  across %d AZ(s)",
-                 "TOTAL", sum(held.values()), len(held))
+            got = held[az]
+            if per_az_cores:
+                flag = "FULL" if got >= per_az_cores else "short"
+                log.info("  %-12s %5d / %d vCPU  (%d x i4i.16xlarge) [%s]",
+                         az, got, per_az_cores, got // v16, flag)
+            else:
+                log.info("  %-12s %5d vCPU  (%d x i4i.16xlarge)",
+                         az, got, got // v16)
+        total = sum(held.values())
+        if target_cores:
+            flag = "FULL" if total >= target_cores else "short"
+            log.info("  %-12s %5d / %d vCPU  across %d AZ(s) [%s]",
+                     "TOTAL", total, target_cores, len(held), flag)
+        else:
+            log.info("  %-12s %5d vCPU  across %d AZ(s)",
+                     "TOTAL", total, len(held))
 
 
 def cancel_all(client, dry_run):
@@ -235,7 +251,13 @@ def run(args):
     client = ec2_client(args.region)
 
     if args.list:
-        print_list(client)
+        # Show target/progress only if the caller passed targets to --list.
+        # target_cores defaults to 8 (placeholder) — treat that as "unset".
+        # If only --per-az-cores given, derive total = per_az x #--azs.
+        tgt = None if args.target_cores == 8 else args.target_cores
+        if args.per_az_cores and tgt is None and args.azs:
+            tgt = args.per_az_cores * len(args.azs)
+        print_list(client, target_cores=tgt, per_az_cores=args.per_az_cores)
         return
 
     if args.cancel_all:
