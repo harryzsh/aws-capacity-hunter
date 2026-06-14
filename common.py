@@ -87,11 +87,16 @@ def setup_logging(logfile=None):
     return logger
 
 
-def record_grab(via, itype, az, vcpu, total, target, region, dry_run):
+def record_grab(via, itype, az, vcpu, total, target, region, dry_run,
+                per_az_cores=None, per_az_total=None):
     """Append one JSON line to the ledger every time we secure capacity.
 
     Machine-readable feed for downstream tooling (parsers, dashboards, etc.).
     Skipped during dry-run so the ledger only ever holds real grabs.
+
+    per_az_cores:  the --per-az-cores cap in effect (None if not balanced mode).
+    per_az_total:  cores held in THIS az after this grab (so the ledger shows
+                   how the balanced run progresses per AZ, not just the total).
     """
     if dry_run:
         return
@@ -105,6 +110,8 @@ def record_grab(via, itype, az, vcpu, total, target, region, dry_run):
         "vcpu": vcpu,
         "total_vcpu": total,
         "target_vcpu": target,
+        "per_az_cores": per_az_cores,    # cap per AZ (null = not balanced mode)
+        "per_az_total": per_az_total,    # cores held in this AZ after this grab
     }
     with open(GRAB_LEDGER, "a") as f:
         f.write(json.dumps(rec) + "\n")
