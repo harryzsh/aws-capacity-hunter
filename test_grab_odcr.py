@@ -11,9 +11,11 @@ pure-Python core that makes a crash/restart safe —
     fill up. After a restart, full AZs are skipped and only the short ones get
     topped up — never double-grab a full AZ, never go lopsided.
   * print_list(): --list prints a per-AZ + total CORE summary.
+  * reserve_one() / list_reservations() / cancel_all(): the 3 ODCR API wrappers.
 
 Run:  python3 -m unittest test_grab_odcr -v
 """
+import datetime
 import logging
 import unittest
 from argparse import Namespace
@@ -22,7 +24,8 @@ from botocore.exceptions import ClientError
 
 import grab_odcr
 from grab_odcr import (
-    held_cores_by_az, _az_full, sweep_once, print_list, TAG_KEY, TAG_VAL,
+    held_cores_by_az, _az_full, sweep_once, print_list,
+    reserve_one, list_reservations, cancel_all, TAG_KEY, TAG_VAL,
 )
 from common import VCPU
 
@@ -48,12 +51,15 @@ class FakeEC2:
         self._reservations = reservations or []
         self._no_capacity = set(no_capacity)
         self.created = []          # list of (itype, az)
+        self.create_kwargs = []    # full kwargs of each create call
+        self.cancelled = []        # crids passed to cancel
         self._n = 0
 
     def describe_capacity_reservations(self, **kwargs):
         return {"CapacityReservations": self._reservations}
 
     def create_capacity_reservation(self, **kwargs):
+        self.create_kwargs.append(kwargs)
         if kwargs.get("DryRun"):
             raise _cap_error("DryRunOperation")
         az = kwargs["AvailabilityZone"]
@@ -62,6 +68,10 @@ class FakeEC2:
         self._n += 1
         self.created.append((kwargs["InstanceType"], az))
         return {"CapacityReservation": {"CapacityReservationId": "cr-%04d" % self._n}}
+
+    def cancel_capacity_reservation(self, CapacityReservationId=None):
+        self.cancelled.append(CapacityReservationId)
+        return {}
 
 
 def _reservation(itype, az, count, tag=TAG_VAL, state="active"):
@@ -303,6 +313,93 @@ class DryRunPlan(unittest.TestCase):
         self.assertEqual(held, {"us-east-1b": cap, "us-east-1d": cap})
         # ...but NOT one real reservation was created.
         self.assertEqual(client.created, [])
+
+
+class ReserveOne(unittest.TestCase):
+    """The single CreateCapacityReservation call — pin the exact params that
+    make an OPEN, Linux/UNIX, default-tenancy, count=1 reservation (the 4
+    attributes an ASG must match), plus dry-run and end-hours behavior."""
+
+    def test_open_linux_default_count1_tagged(self):
+        client = FakeEC2()
+        reserve_one(client, "i4i.16xlarge", "us-east-1b", dry_run=False)
+        kw = client.create_kwargs[-1]
+        self.assertEqual(kw["InstanceType"], "i4i.16xlarge")
+        self.assertEqual(kw["InstancePlatform"], "Linux/UNIX")
+        self.assertEqual(kw["AvailabilityZone"], "us-east-1b")
+        self.assertEqual(kw["InstanceCount"], 1)
+        self.assertEqual(kw["InstanceMatchCriteria"], "open")
+        self.assertEqual(kw["Tenancy"], "default")
+        self.assertEqual(kw["DryRun"], False)
+        # tagged so --list / --cancel-all / held_cores can find it
+        tags = kw["TagSpecifications"][0]["Tags"]
+        self.assertIn({"Key": TAG_KEY, "Value": TAG_VAL}, tags)
+
+    def test_dry_run_flag_passes_through(self):
+        client = FakeEC2()
+        with self.assertRaises(ClientError):     # FakeEC2 raises DryRunOperation
+            reserve_one(client, "i4i.16xlarge", "us-east-1b", dry_run=True)
+        self.assertTrue(client.create_kwargs[-1]["DryRun"])
+
+    def test_no_end_hours_is_unlimited(self):
+        client = FakeEC2()
+        reserve_one(client, "i4i.16xlarge", "us-east-1b", dry_run=False)
+        kw = client.create_kwargs[-1]
+        self.assertEqual(kw["EndDateType"], "unlimited")
+        self.assertNotIn("EndDate", kw)
+
+    def test_end_hours_sets_limited_with_future_enddate(self):
+        client = FakeEC2()
+        reserve_one(client, "i4i.16xlarge", "us-east-1b", dry_run=False,
+                    end_hours=6)
+        kw = client.create_kwargs[-1]
+        self.assertEqual(kw["EndDateType"], "limited")
+        self.assertIn("EndDate", kw)
+        self.assertGreater(kw["EndDate"], datetime.datetime.utcnow())
+
+
+class ListReservations(unittest.TestCase):
+    def test_parses_rows_and_tag(self):
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 3),
+            _reservation("i4i.8xlarge", "us-east-1d", 1, tag="other"),
+        ])
+        rows = list_reservations(client)
+        self.assertEqual(len(rows), 2)
+        crid, itype, az, state, cnt, tag = rows[0]
+        self.assertEqual(itype, "i4i.16xlarge")
+        self.assertEqual(az, "us-east-1b")
+        self.assertEqual(state, "active")
+        self.assertEqual(cnt, 3)
+        self.assertEqual(tag, TAG_VAL)
+        self.assertEqual(rows[1][5], "other")          # tag passthrough
+
+    def test_untagged_reservation_yields_empty_tag(self):
+        client = FakeEC2([_reservation("i4i.16xlarge", "us-east-1b", 1, tag=None)])
+        self.assertEqual(list_reservations(client)[0][5], "")
+
+
+class CancelAll(unittest.TestCase):
+    def test_only_cancels_our_tagged_reservations(self):
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 3),              # ours
+            _reservation("i4i.16xlarge", "us-east-1d", 2),              # ours
+            _reservation("i4i.16xlarge", "us-east-1c", 9, tag="other"),  # NOT ours
+            _reservation("i4i.16xlarge", "us-east-1a", 9, tag=None),     # NOT ours
+        ])
+        cancel_all(client, dry_run=False)
+        # exactly the two tagged ones cancelled, others untouched
+        self.assertEqual(len(client.cancelled), 2)
+
+    def test_dry_run_cancels_nothing(self):
+        client = FakeEC2([_reservation("i4i.16xlarge", "us-east-1b", 3)])
+        cancel_all(client, dry_run=True)
+        self.assertEqual(client.cancelled, [])
+
+    def test_nothing_tagged_is_noop(self):
+        client = FakeEC2([_reservation("i4i.16xlarge", "us-east-1b", 3, tag="other")])
+        cancel_all(client, dry_run=False)
+        self.assertEqual(client.cancelled, [])
 
 
 if __name__ == "__main__":
