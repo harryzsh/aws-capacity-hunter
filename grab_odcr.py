@@ -106,11 +106,16 @@ def list_reservations(client):
     return rows
 
 
-def held_cores_by_az(client):
+def held_cores_by_az(client, only_azs=None):
     """Sum vCPU per AZ across THIS script's tagged reservations, read LIVE
     from AWS. Counts CORES (TotalInstanceCount x per-instance vCPU), NOT the
     number of reservation objects — one reservation can hold many instances,
     so counting objects would be meaningless.
+
+    only_azs: if given (a set/list of AZ names), count ONLY those AZs. This
+        keeps the stop-gate in scope when you target a subset of AZs: e.g.
+        `--azs us-east-1d` must not let stock already held in us-east-1b
+        inflate the total and stop the run before 1d is filled.
 
     This is the stop-gate's source of truth. Re-reading it every round is what
     makes restarts safe: after a crash we see exactly what we already hold, per
@@ -119,6 +124,8 @@ def held_cores_by_az(client):
     held = {}
     for _crid, itype, az, _state, cnt, tag, _avail in list_reservations(client):
         if tag != TAG_VAL or itype not in VCPU:
+            continue
+        if only_azs is not None and az not in only_azs:
             continue
         held[az] = held.get(az, 0) + VCPU[itype] * (cnt or 1)
     return held
@@ -354,9 +361,14 @@ def run(args):
     # held = per-AZ cores we ACTUALLY hold, the stop-gate's source of truth.
     # LIVE: seed from AWS so a restart resumes exactly where we left off.
     # dry-run: start empty and simulate locally so the plan preview is clean.
-    held = held_cores_by_az(client) if args.live else {}
+    #
+    # IMPORTANT: count ONLY the AZs we're sweeping (only_azs=set(azs)). If you
+    # target one AZ (--azs us-east-1d) but already hold stock in another
+    # (us-east-1b), that out-of-scope stock would inflate the TOTAL gate and
+    # stop the run before the targeted AZ is filled.
+    held = held_cores_by_az(client, only_azs=set(azs)) if args.live else {}
     if args.live and held:
-        log.info("resumed from AWS: %d vCPU already held across AZs %s",
+        log.info("resumed from AWS: %d vCPU already held in target AZs %s",
                  sum(held.values()), held)
 
     if args.watch:
@@ -367,9 +379,10 @@ def run(args):
             rounds += 1
             # Re-read AWS truth each round (live): this is what makes the watch
             # loop self-correcting and restart-safe — per-AZ caps are always
-            # judged against what we really hold right now.
+            # judged against what we really hold right now. Same AZ-scope filter
+            # as the seed above.
             if args.live:
-                held = held_cores_by_az(client)
+                held = held_cores_by_az(client, only_azs=set(azs))
             log.info("--- watch round %d (have %d/%d vCPU | per-AZ %s) ---",
                      rounds, sum(held.values()), args.target_cores, held)
             sweep_once(client, args, azs, offered, held, made)
