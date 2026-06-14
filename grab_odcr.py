@@ -36,12 +36,14 @@ Examples:
 import argparse
 import sys
 import time
+import json
+import os
 import datetime
 
 from botocore.exceptions import ClientError
 
 from common import (
-    DEFAULT_REGION, VCPU, DEFAULT_PRIORITY, ec2_client, list_azs,
+    DEFAULT_REGION, VCPU, DEFAULT_PRIORITY, GRAB_LEDGER, ec2_client, list_azs,
     offered_types_by_az, backoff_sleep, classify, setup_logging,
     record_grab, resolve_types, resolve_azs,
 )
@@ -121,16 +123,37 @@ def held_cores_by_az(client):
     return held
 
 
+def _targets_from_ledger():
+    """Read the most recent (target_vcpu, per_az_cores) from grabs.jsonl.
+
+    So `--list` ALONE can show progress — it remembers what target you were
+    grabbing toward, no need to re-type --target-cores / --per-az-cores.
+    Returns (target_cores, per_az_cores), each None if unavailable.
+    """
+    try:
+        with open(GRAB_LEDGER) as f:
+            lines = [ln for ln in f if ln.strip()]
+        if not lines:
+            return None, None
+        last = json.loads(lines[-1])
+        return last.get("target_vcpu"), last.get("per_az_cores")
+    except (FileNotFoundError, ValueError, KeyError):
+        return None, None
+
+
 def print_list(client, target_cores=None, per_az_cores=None):
     """--list: show every tagged reservation, then a per-AZ + total summary.
 
     The summary answers the two questions you actually have during a grab:
     "how many cores do I hold total?" and "how is it split across AZs?"
 
-    If you ALSO pass --target-cores / --per-az-cores to --list, the summary
-    shows held/target progress and a FULL/short flag, so you can see at a
-    glance how close you are without doing the math.
+    Progress (held/target + FULL/short) is shown automatically: if you don't
+    pass --target-cores / --per-az-cores, they're read from the last grab in
+    grabs.jsonl — so plain `--list` already shows how close you are.
     """
+    # Fall back to the ledger's last-known targets when caller didn't pass any.
+    if target_cores is None and per_az_cores is None:
+        target_cores, per_az_cores = _targets_from_ledger()
     rows = list_reservations(client)
     if not rows:
         log.info("no active/pending reservations")
@@ -251,13 +274,18 @@ def run(args):
     client = ec2_client(args.region)
 
     if args.list:
-        # Show target/progress only if the caller passed targets to --list.
-        # target_cores defaults to 8 (placeholder) — treat that as "unset".
-        # If only --per-az-cores given, derive total = per_az x #--azs.
+        # Targets are read automatically from grabs.jsonl inside print_list,
+        # so plain --list shows progress. If the caller DID pass them, prefer
+        # those: target_cores defaults to 8 (placeholder) — treat that as unset;
+        # if only --per-az-cores given, derive total = per_az x #--azs.
         tgt = None if args.target_cores == 8 else args.target_cores
-        if args.per_az_cores and tgt is None and args.azs:
-            tgt = args.per_az_cores * len(args.azs)
-        print_list(client, target_cores=tgt, per_az_cores=args.per_az_cores)
+        per_az = args.per_az_cores
+        if per_az and tgt is None and args.azs:
+            tgt = per_az * len(args.azs)
+        if tgt is None and per_az is None:
+            print_list(client)                       # auto-read from ledger
+        else:
+            print_list(client, target_cores=tgt, per_az_cores=per_az)
         return
 
     if args.cancel_all:
@@ -383,7 +411,8 @@ def main():
     p.add_argument("--cancel-all", action="store_true",
                    help="cancel all reservations tagged %s=%s" % (TAG_KEY, TAG_VAL))
     p.add_argument("--list", action="store_true",
-                   help="list current reservations + per-AZ/total core summary, then exit")
+                   help="list current reservations + per-AZ/total core summary "
+                        "(auto-reads target from grabs.jsonl), then exit")
     args = p.parse_args()
     try:
         run(args)
