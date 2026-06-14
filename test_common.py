@@ -192,7 +192,8 @@ class RecordGrab(unittest.TestCase):
 
     def test_live_appends_one_json_line_with_fields(self):
         record_grab("odcr", "i4i.16xlarge", "us-east-1b", 64, 128, 10000,
-                    "us-east-1", dry_run=False)
+                    "us-east-1", dry_run=False,
+                    per_az_cores=5000, per_az_total=64)
         with open(self.ledger) as f:
             lines = f.read().splitlines()
         self.assertEqual(len(lines), 1)
@@ -204,7 +205,18 @@ class RecordGrab(unittest.TestCase):
         self.assertEqual(rec["total_vcpu"], 128)
         self.assertEqual(rec["target_vcpu"], 10000)
         self.assertEqual(rec["region"], "us-east-1")
+        self.assertEqual(rec["per_az_cores"], 5000)   # balanced-mode cap recorded
+        self.assertEqual(rec["per_az_total"], 64)     # cores held in this AZ
         self.assertIn("ts", rec)
+
+    def test_per_az_fields_null_when_not_balanced(self):
+        # no per-az args -> fields present but null (not missing)
+        record_grab("odcr", "i4i.16xlarge", "us-east-1b", 64, 64, 1000,
+                    "us-east-1", dry_run=False)
+        with open(self.ledger) as f:
+            rec = json.loads(f.read().splitlines()[0])
+        self.assertIsNone(rec["per_az_cores"])
+        self.assertIsNone(rec["per_az_total"])
 
     def test_appends_not_overwrites(self):
         for i in range(3):
