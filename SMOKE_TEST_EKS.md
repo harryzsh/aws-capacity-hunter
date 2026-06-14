@@ -1,6 +1,6 @@
 # EKS Self-Managed Node Group Smoke Test（美东 us-east-1）
 
-**目标**：在 `476114114317` / `us-east-1` 端到端验证——
+**目标**：在 `<ACCOUNT_ID>` / `us-east-1` 端到端验证——
 1. `grab_odcr.py` 能**真抢到** i4i.16xlarge 的 ODCR；
 2. 一个**全新独立的 EKS 集群 + self-managed node group（每 AZ 一个 ASG）** 能把这些预留**吃进去**、节点 `Ready` 入集群、Pod 调度上去。
 
@@ -10,7 +10,7 @@
 
 ## 🔴 头号铁律：绝不触碰生产 `litellm-cluster`
 
-生产集群：`arn:aws:eks:us-east-1:476114114317:cluster/litellm-cluster`。本测试与它**零交集**，靠以下硬隔离保证：
+生产集群：`arn:aws:eks:us-east-1:<ACCOUNT_ID>:cluster/litellm-cluster`。本测试与它**零交集**，靠以下硬隔离保证：
 
 | 隔离维度 | 本测试用 | 生产 | 怎么保证不串 |
 |---|---|---|---|
@@ -18,7 +18,7 @@
 | **VPC** | **新建专用 VPC**（`10.99.0.0/16`） | 各自独立 | 不复用默认 VPC、不碰生产 VPC，物理隔离 |
 | **资源 tag** | `purpose=i4i-smoke-eks` | — | 所有 create 都打这个 tag；所有 delete 都按这个 tag 过滤 |
 | **ODCR tag** | `primeday-i4i-grab`（脚本默认） | — | `--cancel-all` 只取消这个 tag 的预留 |
-| **IAM/账号** | 同账号 `476114114317` | 同账号 | open 预留需同账号——这是唯一共享面，但预留是新建的、tag 独立 |
+| **IAM/账号** | 同账号 `<ACCOUNT_ID>` | 同账号 | open 预留需同账号——这是唯一共享面，但预留是新建的、tag 独立 |
 
 > ⚠️ **每一条 `delete` / `cancel` 命令执行前，先肉眼确认命令里的集群名是 `i4i-smoke-eks`、tag 是 `i4i-smoke-eks` 或 `primeday-i4i-grab`。** 凡是命令里出现 `litellm` 字样 —— 立刻停手，这不是本测试该碰的东西。
 >
@@ -38,15 +38,16 @@
 ## 环境变量（先设好，后面命令都引用）
 
 ```bash
-export AWS_PROFILE=<你的 476114114317 profile>
+export AWS_PROFILE=<你的账号 profile>
 export AWS_REGION=us-east-1
 export CLUSTER=i4i-smoke-eks            # ← 测试集群名，绝不等于 litellm-cluster
 export TAG=i4i-smoke-eks               # ← 测试资源统一 tag
 export AZ1=us-east-1b
 export AZ2=us-east-1d
+export ACCOUNT_ID=<你的账号 ID>        # 用于开跑前断言
 
-# 开跑前断言：当前账号确实是 476114114317，否则停手
-test "$(aws sts get-caller-identity --query Account --output text)" = "476114114317" \
+# 开跑前断言：当前账号确实是目标账号，否则停手
+test "$(aws sts get-caller-identity --query Account --output text)" = "$ACCOUNT_ID" \
   && echo "account OK" || { echo "WRONG ACCOUNT — STOP"; }
 ```
 
