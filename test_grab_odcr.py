@@ -11,7 +11,7 @@ pure-Python core that makes a crash/restart safe —
     fill up. After a restart, full AZs are skipped and only the short ones get
     topped up — never double-grab a full AZ, never go lopsided.
   * print_list(): --list prints a per-AZ + total CORE summary (optional target,
-    auto-read from the ledger).
+    auto-read from the ledger) + per-reservation USED/free + used/total tally.
   * reserve_one() / list_reservations() / cancel_all(): the 3 ODCR API wrappers.
 
 Run:  python3 -m unittest test_grab_odcr -v
@@ -78,13 +78,16 @@ class FakeEC2:
         return {}
 
 
-def _reservation(itype, az, count, tag=TAG_VAL, state="active"):
+def _reservation(itype, az, count, tag=TAG_VAL, state="active", available=None):
+    # available defaults to count (all free / unused). Pass available<count to
+    # simulate a reservation that has instances in it (USED).
     r = {
         "CapacityReservationId": "cr-existing",
         "InstanceType": itype,
         "AvailabilityZone": az,
         "State": state,
         "TotalInstanceCount": count,
+        "AvailableInstanceCount": count if available is None else available,
     }
     if tag is not None:
         r["Tags"] = [{"Key": TAG_KEY, "Value": tag}]
@@ -195,9 +198,27 @@ class PrintListSummary(unittest.TestCase):
                 with self.assertLogs("i4i-grab", level="INFO") as cm:
                     print_list(client)                 # no targets, no ledger
         out = "\n".join(cm.output)
-        self.assertNotIn("/", out.split("summary")[-1])  # no "held / target"
+        # no "held / target vCPU" progress and no FULL/short flag
+        self.assertNotIn("/ 1 vCPU", out)
+        self.assertNotIn("vCPU [", out)
         self.assertNotIn("[FULL]", out)
         self.assertNotIn("[short]", out)
+
+    def test_used_column_and_used_total_summary(self):
+        # 3 ours: 2 occupied (available<count), 1 free; + 1 not-ours (ignored)
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 1, available=0),  # USED
+            _reservation("i4i.16xlarge", "us-east-1b", 1, available=0),  # USED
+            _reservation("i4i.16xlarge", "us-east-1d", 1, available=1),  # free
+            _reservation("i4i.16xlarge", "us-east-1c", 1, available=0, tag="x"),  # not ours
+        ])
+        with self.assertLogs("i4i-grab", level="INFO") as cm:
+            print_list(client)
+        out = "\n".join(cm.output)
+        self.assertIn("USED", out)                       # per-row + summary label
+        self.assertIn("free", out)                       # the unoccupied one
+        # summary counts only OUR tagged: 2 used out of 3
+        self.assertIn("2 / 3 reservations USED", out)
 
     def test_list_auto_reads_target_from_ledger(self):
         # plain print_list() with NO target args should read target from the
@@ -418,12 +439,13 @@ class ListReservations(unittest.TestCase):
         ])
         rows = list_reservations(client)
         self.assertEqual(len(rows), 2)
-        crid, itype, az, state, cnt, tag = rows[0]
+        crid, itype, az, state, cnt, tag, avail = rows[0]
         self.assertEqual(itype, "i4i.16xlarge")
         self.assertEqual(az, "us-east-1b")
         self.assertEqual(state, "active")
         self.assertEqual(cnt, 3)
         self.assertEqual(tag, TAG_VAL)
+        self.assertEqual(avail, 3)                     # available slots (7th field)
         self.assertEqual(rows[1][5], "other")          # tag passthrough
 
     def test_untagged_reservation_yields_empty_tag(self):
