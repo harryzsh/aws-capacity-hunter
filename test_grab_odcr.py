@@ -5,7 +5,8 @@ These tests mock boto3 entirely (no AWS calls, no cost, runs in CI). They pin
 the behavior that the real Smoke Tests in SMOKE_TEST.md do NOT cover: the
 pure-Python core that makes a crash/restart safe —
 
-  * held_cores_by_az(): count CORES (TotalInstanceCount x vCPU), not objects
+  * held_cores_by_az(): count CORES (TotalInstanceCount x vCPU), not objects;
+    only_azs= restricts the count to in-scope AZs.
   * _az_full(): per-AZ cap judged against cores actually held
   * sweep_once(): ONE grab per AZ per pass; the --watch loop repeats sweeps to
     fill up. After a restart, full AZs are skipped and only the short ones get
@@ -147,6 +148,21 @@ class HeldCoresByAz(unittest.TestCase):
     def test_skips_unknown_instance_type(self):
         client = FakeEC2([_reservation("c7gd.metal", "us-east-1b", 2)])
         self.assertEqual(held_cores_by_az(client), {})
+
+    def test_only_azs_filters_out_of_scope_stock(self):
+        # The --azs scope bug: targeting only 1d must NOT count 1b's stock,
+        # else 1b inflates the total gate and stops the run before 1d fills.
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 4),   # 256 (out of scope)
+            _reservation("i4i.16xlarge", "us-east-1d", 3),   # 192 (in scope)
+        ])
+        # no filter -> counts both
+        self.assertEqual(held_cores_by_az(client),
+                         {"us-east-1b": 256, "us-east-1d": 192})
+        # only 1d -> 1b's 256 excluded, total reflects just 1d
+        only = held_cores_by_az(client, only_azs={"us-east-1d"})
+        self.assertEqual(only, {"us-east-1d": 192})
+        self.assertEqual(sum(only.values()), 192)   # gate sees 192, not 448
 
 
 class PrintListSummary(unittest.TestCase):
