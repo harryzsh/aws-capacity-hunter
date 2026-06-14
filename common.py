@@ -1,6 +1,6 @@
-"""Shared helpers for the i4i capacity-grab scripts.
+"""Shared helpers for the i4i capacity-grab script.
 
-Both grab_ondemand.py and grab_odcr.py import from here.
+grab_odcr.py imports from here.
 Region is configurable via --region (default: us-east-1).
 """
 import os
@@ -98,7 +98,7 @@ def record_grab(via, itype, az, vcpu, total, target, region, dry_run):
     os.makedirs(LOGS_DIR, exist_ok=True)
     rec = {
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "via": via,                # "ondemand" | "odcr"
+        "via": via,                # "odcr"
         "instance_type": itype,
         "az": az,
         "region": region,
@@ -155,18 +155,6 @@ def list_azs(client):
         Filters=[{"Name": "state", "Values": ["available"]}]
     )
     return sorted(z["ZoneName"] for z in resp["AvailabilityZones"])
-
-
-def subnets_by_az(client):
-    """Map AZ -> a usable subnet id (needed for RunInstances)."""
-    resp = client.describe_subnets()
-    out = {}
-    for s in resp["Subnets"]:
-        # prefer default-for-az, but accept any subnet as fallback
-        az = s["AvailabilityZone"]
-        if az not in out or s.get("DefaultForAz"):
-            out[az] = s["SubnetId"]
-    return out
 
 
 def offered_types_by_az(client, types):
