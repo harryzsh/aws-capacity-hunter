@@ -1,87 +1,198 @@
 #!/usr/bin/env python3
-"""Grab g7e.48xlarge capacity via On-Demand Capacity Reservations (COUNT-based).
+"""Grab G-series (g6e + g7e) capacity via On-Demand Capacity Reservations.
 
-Region is configurable via --region (default: us-east-1).
+COUNT-based, MULTI-TYPE. Region is configurable via --region (default us-east-1).
 
-This is the count-based sibling of the repo's i4i grabber. The i4i script
-counts vCPU; this one counts INSTANCES (台数). There is exactly ONE instance
-type — g7e.48xlarge — so every unit is "one g7e.48xlarge", and the stop-gates
-are instance counts, not cores.
+You say how many of EACH .48xlarge type to grab, optionally with explicit
+per-AZ counts that can DIFFER per type. Internally everything compiles to a
+target matrix:  (instance_type, az) -> desired instance count.
 
-Strategy: sweep across AZs, CreateCapacityReservation count=1 each
-(all-or-nothing per call, so count=1 scavenges single-instance fragments),
-tag each reservation, count INSTANCES toward a target, stop at the cap.
+Three ways to specify the target (all compile to the same matrix):
+
+  A) EXPLICIT per-(type,az) — counts may differ per AZ and per type:
+       --az-counts g7e.48xlarge@us-east-1b=5 g7e.48xlarge@us-east-1d=3 \
+                   g6e.48xlarge@us-east-1b=2 g6e.48xlarge@us-east-1d=10
+  B) per-type TOTAL, evenly balanced across --azs:
+       --counts g6e.48xlarge=10 g7e.48xlarge=20 --azs us-east-1b us-east-1d --balance
+  C) per-type TOTAL, greedy fill (no per-AZ cap):
+       --counts g6e.48xlarge=10 g7e.48xlarge=20 --azs us-east-1b us-east-1d
+
+  (backward compat — single g7e via the old flags:)
+       --target-count 4 --per-az-count 2 --azs us-east-1b us-east-1d
+
+Strategy: sweep over the target cells, CreateCapacityReservation count=1 each
+(all-or-nothing per call, so count=1 scavenges single-instance fragments), tag
+each reservation, count INSTANCES per (type,az) toward the cell/type caps.
 
 WATCH MODE (--watch): loop forever, re-sweeping every --interval seconds.
-Capacity is intermittent, so 24x7 watching is how you actually catch it.
-Every real reservation is logged and appended to logs/grabs.jsonl.
+RESUME / IDEMPOTENCY: the gates read what we ACTUALLY hold from AWS each round
+(held_by_type_az), per (type,az), counting instances. A crash/restart resumes
+exactly where it left off, topping up only the real shortfall per cell.
 
-RESUME / IDEMPOTENCY: the per-AZ and total stop-gates read what we ACTUALLY
-hold from AWS each round (held_count_by_az), counting INSTANCES
-(sum of TotalInstanceCount) not reservation objects. So a crash/restart/
-host-reboot picks up exactly where it left off: each AZ is judged against its
-own real held instance count, and the sweep only tops up the true shortfall
-per AZ. No in-memory counter to lose, no double-grab, no lopsided distribution
-after a restart. Safe under systemd Restart=always.
-
-Why ODCR over plain On-Demand: a reservation HOLDS the slot even when no
-instance occupies it (and across stop/terminate/ASG-rollover). Trade-off:
-an ACTIVE reservation bills at the On-Demand rate whether filled or not.
+Why ODCR: a reservation HOLDS the slot even when no instance occupies it.
+Trade-off: an ACTIVE reservation bills at On-Demand rate whether filled or not.
 (Capacity Blocks for ML do NOT cover the G family, so ODCR is the tool here.)
 
-SAFETY: default is --dry-run (validates IAM + params, reserves nothing).
-Use --live to actually reserve. Use --cancel-all to release everything.
-Immediate-use reservations here have NO commitment and cancel anytime.
-
-Examples:
-  python3 grab_g7e_odcr.py --target-count 1                      # dry-run plan
-  python3 grab_g7e_odcr.py --target-count 4 --live               # really reserve
-  python3 grab_g7e_odcr.py --azs us-east-1b us-east-1d --per-az-count 2 --live --watch
-  python3 grab_g7e_odcr.py --cancel-all --live                   # release all
-  python3 grab_g7e_odcr.py --list                                # show reservations
+SAFETY: default is --dry-run. Use --live to actually reserve, --cancel-all to
+release everything, --check-quota to preflight the shared G/VT vCPU quota.
 """
 import argparse
 import sys
 import time
-import json
-import datetime
 
 from botocore.exceptions import ClientError
 
 from common import (
-    DEFAULT_REGION, INSTANCE_TYPE, VCPU_PER, TAG_KEY, TAG_VAL, GRAB_LEDGER,
-    ec2_client, list_azs, offered_in_azs, backoff_sleep, classify,
-    setup_logging, record_grab, resolve_azs,
+    DEFAULT_REGION, VCPU, SUPPORTED_TYPES, DEFAULT_TYPE, TAG_KEY, TAG_VAL,
+    ec2_client, list_azs, offered_by_az, backoff_sleep, classify,
+    setup_logging, record_grab, resolve_azs, save_plan, load_plan,
 )
 
-# --target-count placeholder: a tiny value treated as "unset" so balanced mode
-# (per-az-count x #AZ) can auto-fill the real total. Mirrors the i4i grabber's
-# "default 8 = untouched" convention, but count-based so the default is 1.
+# --target-count placeholder: a tiny value treated as "unset" so the compat
+# balanced mode (per-az-count x #AZ) can auto-fill the real total.
 DEFAULT_TARGET = 1
 
 # Logging is ALWAYS on (console + rotating file) — the fallback record of truth.
 log = setup_logging("grab_g7e_odcr.log")
 
 
-def reserve_one(client, az, dry_run, end_hours=None):
-    """Create a count=1 g7e.48xlarge ODCR. open matching, no commitment.
+# --------------------------------------------------------------------------- #
+# CLI target parsing (pure, unit-tested)
+# --------------------------------------------------------------------------- #
+def parse_counts(items):
+    """['g6e.48xlarge=10', 'g7e.48xlarge=20'] -> {type: int}.
+
+    Raises ValueError on bad syntax, unknown/unsupported type, or non-positive.
+    """
+    out = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError("bad --counts entry %r (want TYPE=N)" % item)
+        t, n = item.split("=", 1)
+        t = t.strip()
+        if t not in VCPU:
+            raise ValueError("unsupported type %r (allowed: %s)"
+                             % (t, ", ".join(SUPPORTED_TYPES)))
+        try:
+            n = int(n)
+        except ValueError:
+            raise ValueError("bad count in %r (want integer)" % item)
+        if n <= 0:
+            raise ValueError("count must be > 0 in %r" % item)
+        out[t] = out.get(t, 0) + n
+    return out
+
+
+def parse_az_counts(items):
+    """['g7e.48xlarge@us-east-1b=5', ...] -> {(type, az): int}.
+
+    Raises ValueError on bad syntax, unknown/unsupported type, or non-positive.
+    """
+    out = {}
+    for item in items:
+        if "@" not in item or "=" not in item:
+            raise ValueError("bad --az-counts entry %r (want TYPE@AZ=N)" % item)
+        left, n = item.split("=", 1)
+        t, az = left.split("@", 1)
+        t, az = t.strip(), az.strip()
+        if t not in VCPU:
+            raise ValueError("unsupported type %r (allowed: %s)"
+                             % (t, ", ".join(SUPPORTED_TYPES)))
+        if not az:
+            raise ValueError("missing AZ in %r" % item)
+        try:
+            n = int(n)
+        except ValueError:
+            raise ValueError("bad count in %r (want integer)" % item)
+        if n <= 0:
+            raise ValueError("count must be > 0 in %r" % item)
+        out[(t, az)] = out.get((t, az), 0) + n
+    return out
+
+
+def distribute(total, azs):
+    """Split `total` as evenly as possible across `azs` (front-loaded remainder).
+
+    distribute(10, [a,b]) -> [5,5]; distribute(11,[a,b]) -> [6,5];
+    distribute(1,[a,b])  -> [1,0].
+    """
+    k = len(azs)
+    if k == 0:
+        return []
+    base, rem = divmod(total, k)
+    return [base + (1 if i < rem else 0) for i in range(k)]
+
+
+def build_plan(args, all_azs):
+    """Resolve CLI args into (cells, type_targets).
+
+    cells:        {(type,az): cap_or_None}  per-cell hard cap; None = no cap
+                  (greedy). Insertion order is the sweep order.
+    type_targets: {type: total}  hard overall target per type.
+
+    `all_azs` is the region's AZ list, used only when AZs aren't otherwise
+    determined (--counts/compat without --azs).
+    """
+    cells, type_targets = {}, {}
+
+    if args.az_counts:
+        matrix = parse_az_counts(args.az_counts)
+        for (t, az), n in matrix.items():
+            cells[(t, az)] = n
+            type_targets[t] = type_targets.get(t, 0) + n
+        return cells, type_targets
+
+    if args.counts:
+        per_type = parse_counts(args.counts)
+        azs = args.azs if args.azs else list(all_azs)
+        for t in sorted(per_type):
+            total = per_type[t]
+            type_targets[t] = total
+            if args.balance:
+                for az, cap in zip(azs, distribute(total, azs)):
+                    cells[(t, az)] = cap
+            else:
+                for az in azs:
+                    cells[(t, az)] = None      # greedy: no per-AZ cap
+        return cells, type_targets
+
+    # Backward-compatible single-type path (old --target-count/--per-az-count).
+    t = DEFAULT_TYPE
+    azs = args.azs if args.azs else list(all_azs)
+    if args.per_az_count is not None:
+        for az in azs:
+            cells[(t, az)] = args.per_az_count
+        if args.target_count == DEFAULT_TARGET:       # untouched default
+            type_targets[t] = args.per_az_count * len(azs)
+        else:
+            type_targets[t] = args.target_count       # hard overall stop
+    else:
+        for az in azs:
+            cells[(t, az)] = None
+        type_targets[t] = args.target_count
+    return cells, type_targets
+
+
+# --------------------------------------------------------------------------- #
+# AWS wrappers
+# --------------------------------------------------------------------------- #
+def reserve_one(client, itype, az, dry_run, end_hours=None):
+    """Create a count=1 ODCR for `itype` in `az`. open matching, no commitment.
 
     end_hours: if set, EndDateType=limited (auto-expires) as a billing guard.
                if None, EndDateType=unlimited (until you cancel).
     """
+    import datetime
     kwargs = dict(
-        InstanceType=INSTANCE_TYPE,
+        InstanceType=itype,
         InstancePlatform="Linux/UNIX",
         AvailabilityZone=az,
         InstanceCount=1,
         InstanceMatchCriteria="open",
         Tenancy="default",
-        # g7e is a Nitro family — EBS optimization is always-on and can't be
-        # disabled. Mark the reservation EBS-optimized so its attributes match
-        # the instances it will hold. NOTE: EbsOptimized is NOT one of the
-        # `open` match criteria (those are instance type / platform / AZ /
-        # tenancy only), so this neither helps nor blocks matching — it's set
-        # for honest attribute alignment, not for placement.
+        # g6e/g7e are Nitro families — EBS optimization is always-on. Mark the
+        # reservation EBS-optimized so its attributes match the instances it
+        # will hold. (Not an `open` match criterion, just honest alignment.)
         EbsOptimized=True,
         DryRun=dry_run,
         TagSpecifications=[{
@@ -114,74 +225,139 @@ def list_reservations(client):
     return rows
 
 
-def held_count_by_az(client, only_azs=None):
-    """Sum INSTANCES per AZ across THIS script's tagged reservations, read LIVE
-    from AWS. Counts instances (TotalInstanceCount), NOT the number of
-    reservation objects — one reservation can hold many instances, so counting
-    objects would be meaningless.
+def held_by_type_az(client, scope=None):
+    """Instances held per (type, az) across THIS script's tagged reservations,
+    read LIVE from AWS. Counts instances (TotalInstanceCount), not objects.
 
-    only_azs: if given (a set/list of AZ names), count ONLY those AZs. This
-        keeps the stop-gate in scope when you target a subset of AZs: e.g.
-        `--azs us-east-1d` must not let stock already held in us-east-1b
-        inflate the total and stop the run before 1d is filled.
-
-    This is the stop-gate's source of truth. Re-reading it every round is what
-    makes restarts safe: after a crash we see exactly what we already hold, per
-    AZ, and only top up the real shortfall — never double-grab, never lopsided.
+    scope: if given (a set of (type,az) tuples), count ONLY those cells — keeps
+        the stop-gates in scope so out-of-plan stock can't inflate them and
+        stop the run early. This is the gate's source of truth; re-reading it
+        each round makes restarts safe.
     """
     held = {}
     for _crid, itype, az, _state, cnt, tag, _avail in list_reservations(client):
-        if tag != TAG_VAL or itype != INSTANCE_TYPE:
+        if tag != TAG_VAL or itype not in VCPU:
             continue
-        if only_azs is not None and az not in only_azs:
+        if scope is not None and (itype, az) not in scope:
             continue
-        held[az] = held.get(az, 0) + (cnt or 0)
+        held[(itype, az)] = held.get((itype, az), 0) + (cnt or 0)
     return held
 
 
-def _targets_from_ledger():
-    """Read the most recent (target_count, per_az_count) from grabs.jsonl.
+def type_held(held, itype):
+    """Total instances of `itype` held across all AZs."""
+    return sum(c for (t, _az), c in held.items() if t == itype)
 
-    So `--list` ALONE can show progress — it remembers what target you were
-    grabbing toward, no need to re-type --target-count / --per-az-count.
-    Returns (target_count, per_az_count), each None if unavailable.
+
+def grand_held(held):
+    return sum(held.values())
+
+
+# --------------------------------------------------------------------------- #
+# gates
+# --------------------------------------------------------------------------- #
+def _cell_full(cells, held, t, az):
+    """True if (t,az) has hit its per-cell cap. Cap None (greedy) = never full
+    on the cell (the per-type total is what stops it)."""
+    cap = cells.get((t, az))
+    if cap is None:
+        return False
+    return held.get((t, az), 0) >= cap
+
+
+def _type_done(type_targets, held, t):
+    return type_held(held, t) >= type_targets.get(t, 0)
+
+
+def _all_done(type_targets, held):
+    return all(_type_done(type_targets, held, t) for t in type_targets)
+
+
+def _azs_for_type(cells, t):
+    """AZs targeted for type t, in plan (insertion) order."""
+    return [az for (tt, az) in cells if tt == t]
+
+
+# --------------------------------------------------------------------------- #
+# sweep
+# --------------------------------------------------------------------------- #
+def _on_grab(args, cells, type_targets, crid, itype, az, held, made):
+    """Bookkeeping for one secured reservation: bump held, log, ledger."""
+    held[(itype, az)] = held.get((itype, az), 0) + 1
+    made.append((crid, itype, az))
+    tt = type_held(held, itype)
+    gt = grand_held(held)
+    cap = cells.get((itype, az))
+    grand_target = sum(type_targets.values())
+    cap_str = str(cap) if cap is not None else "-"
+    log.info("RESERVED %s %s @ %s (+1 | %s@%s: %d/%s | %s: %d/%d | all: %d/%d)",
+             crid, itype, az, itype, az, held[(itype, az)], cap_str,
+             itype, tt, type_targets.get(itype, 0), gt, grand_target)
+    record_grab("odcr", itype, az, 1, tt, type_targets.get(itype, 0),
+                args.region, not args.live, az_cap=cap,
+                az_total=held[(itype, az)], grand_total=gt,
+                grand_target=grand_target)
+
+
+def sweep_once(client, args, cells, type_targets, offered, held, made):
+    """One full pass over the target cells. Mutates held/made in place.
+
+    Grabs at most ONE instance per (type,az) per pass; the --watch loop repeats
+    sweeps to accumulate toward the caps.
     """
-    try:
-        with open(GRAB_LEDGER) as f:
-            lines = [ln for ln in f if ln.strip()]
-        if not lines:
-            return None, None
-        last = json.loads(lines[-1])
-        return last.get("target_count"), last.get("per_az_count")
-    except (FileNotFoundError, ValueError, KeyError):
-        return None, None
+    throttle_attempt = 0
+    for t in sorted(type_targets):
+        if _type_done(type_targets, held, t):
+            continue
+        for az in _azs_for_type(cells, t):
+            if _type_done(type_targets, held, t):
+                break
+            if _cell_full(cells, held, t, az):
+                continue
+            if (t, az) not in offered:
+                continue
+            try:
+                resp = reserve_one(client, t, az, not args.live, args.end_hours)
+                crid = resp["CapacityReservation"]["CapacityReservationId"]
+                _on_grab(args, cells, type_targets, crid, t, az, held, made)
+                throttle_attempt = 0
+            except ClientError as e:
+                kind = classify(e)
+                if kind == "dryrun_ok":
+                    log.info("[dry-run] would reserve %s @ %s (+1)", t, az)
+                    _on_grab(args, cells, type_targets, "(dry-run)", t, az,
+                             held, made)
+                elif kind == "capacity":
+                    log.info("no capacity: %s @ %s — next", t, az)
+                elif kind == "throttle":
+                    log.warning("throttled, backing off (attempt %d)",
+                                throttle_attempt)
+                    backoff_sleep(throttle_attempt)
+                    throttle_attempt += 1
+                else:
+                    log.error("FATAL on %s @ %s: %s", t, az, e.response["Error"])
+                    raise
 
 
-def print_list(client, target_count=None, per_az_count=None):
-    """--list: show every tagged reservation, then a per-AZ + total summary.
-
-    The summary answers the two questions you actually have during a grab:
-    "how many instances do I hold total?" and "how is it split across AZs?"
-
-    Each row also shows USED/free — whether an instance is actually occupying
-    that reservation (Total - Available > 0) — and the summary tallies how many
-    reservations are USED out of the total we hold.
-
-    Progress (held/target + FULL/short) is shown automatically: if you don't
-    pass --target-count / --per-az-count, they're read from the last grab in
-    grabs.jsonl — so plain `--list` already shows how close you are.
+# --------------------------------------------------------------------------- #
+# list / cancel
+# --------------------------------------------------------------------------- #
+def print_list(client, cells=None, type_targets=None):
+    """--list: show every tagged reservation, then a per-(type,az) + per-type +
+    grand-total summary. Progress (held/cap, held/target, FULL/short) is shown
+    when a plan is available — passed in, or auto-read from logs/plan.json.
     """
-    # Fall back to the ledger's last-known targets when caller didn't pass any.
-    if target_count is None and per_az_count is None:
-        target_count, per_az_count = _targets_from_ledger()
+    if cells is None and type_targets is None:
+        cells, type_targets = load_plan()
+    cells = cells or {}
+    type_targets = type_targets or {}
+
     rows = list_reservations(client)
     if not rows:
         log.info("no active/pending reservations")
         return
-    used_n = 0   # reservations with an instance actually IN them (used > 0)
-    ours_n = 0   # our tagged reservations (the denominator)
+    used_n = ours_n = 0
     for crid, itype, az, state, cnt, tag, avail in rows:
-        # USED = is an instance occupying this reservation? (Total - Available)
         total = cnt or 0
         free = avail if avail is not None else total
         used = total - free
@@ -192,29 +368,43 @@ def print_list(client, target_count=None, per_az_count=None):
             ours_n += 1
             if used > 0:
                 used_n += 1
-    # Summary: only OUR tagged g7e.48xlarge reservations, counted in INSTANCES.
-    held = held_count_by_az(client)
-    if held:
-        log.info("--- summary (tag=%s) ---", TAG_VAL)
-        for az in sorted(held):
-            got = held[az]
-            if per_az_count:
-                flag = "FULL" if got >= per_az_count else "short"
-                log.info("  %-12s %4d / %d %s [%s]",
-                         az, got, per_az_count, INSTANCE_TYPE, flag)
+
+    held = held_by_type_az(client)
+    if not held and not type_targets:
+        return
+    log.info("--- summary (tag=%s) ---", TAG_VAL)
+    types = sorted(set([t for (t, _a) in held] + list(type_targets)))
+    grand = 0
+    for t in types:
+        # per-AZ rows for this type
+        azs = sorted(set([a for (tt, a) in held if tt == t]
+                         + [a for (tt, a) in cells if tt == t]))
+        for az in azs:
+            got = held.get((t, az), 0)
+            cap = cells.get((t, az))
+            if cap is not None:
+                flag = "FULL" if got >= cap else "short"
+                log.info("  %-13s %-12s %3d / %d [%s]", t, az, got, cap, flag)
             else:
-                log.info("  %-12s %4d x %s", az, got, INSTANCE_TYPE)
-        total = sum(held.values())
-        if target_count:
-            flag = "FULL" if total >= target_count else "short"
-            log.info("  %-12s %4d / %d instances across %d AZ(s) [%s]",
-                     "TOTAL", total, target_count, len(held), flag)
+                log.info("  %-13s %-12s %3d", t, az, got)
+        tot = type_held(held, t)
+        grand += tot
+        tgt = type_targets.get(t)
+        if tgt is not None:
+            flag = "FULL" if tot >= tgt else "short"
+            log.info("  %-13s %-12s %3d / %d instances [%s]",
+                     t, "TYPE TOTAL", tot, tgt, flag)
         else:
-            log.info("  %-12s %4d instances across %d AZ(s)",
-                     "TOTAL", total, len(held))
-        # How many reservations actually have an instance in them.
-        log.info("  %-12s %d / %d reservations USED (have an instance running)",
-                 "USED", used_n, ours_n)
+            log.info("  %-13s %-12s %3d instances", t, "TYPE TOTAL", tot)
+    grand_target = sum(type_targets.values()) if type_targets else None
+    if grand_target:
+        flag = "FULL" if grand >= grand_target else "short"
+        log.info("  %-13s %-12s %3d / %d instances [%s]",
+                 "GRAND TOTAL", "", grand, grand_target, flag)
+    else:
+        log.info("  %-13s %-12s %3d instances", "GRAND TOTAL", "", grand)
+    log.info("  %d / %d reservations USED (have an instance running)",
+             used_n, ours_n)
 
 
 def cancel_all(client, dry_run):
@@ -234,223 +424,141 @@ def cancel_all(client, dry_run):
             log.error("  cancel failed: %s", e.response.get("Error"))
 
 
-def _on_grab(args, crid, az, held, made):
-    """Bookkeeping for one secured reservation: bump held count, log, ledger.
-
-    held is the per-AZ instance gate (seeded from AWS truth each round); we bump
-    it locally so the gate stays accurate WITHIN a sweep, between AWS re-reads.
-    Each ODCR is count=1, so every grab adds exactly one instance.
-    """
-    held[az] = held.get(az, 0) + 1
-    made.append((crid, INSTANCE_TYPE, az))
-    total = sum(held.values())
-    if args.per_az_count:
-        log.info("RESERVED %s %s @ %s (+1 | %s: %d/%d | total %d/%d)",
-                 crid, INSTANCE_TYPE, az, az, held[az],
-                 args.per_az_count, total, args.target_count)
-    else:
-        log.info("RESERVED %s %s @ %s (+1, total %d/%d)",
-                 crid, INSTANCE_TYPE, az, total, args.target_count)
-    record_grab("odcr", az, 1, total, args.target_count, args.region,
-                not args.live, per_az_count=args.per_az_count,
-                per_az_total=held[az])
-
-
-def _az_full(args, held, az):
-    """True if this AZ has hit its per-AZ instance cap (balanced mode only).
-
-    Judged against instances actually held (READ FROM AWS this round) — so a
-    restart correctly skips an AZ that is already full and keeps topping up the
-    ones that aren't.
-    """
-    if args.per_az_count is None:
-        return False
-    return held.get(az, 0) >= args.per_az_count
-
-
-def sweep_once(client, args, azs, offered, held, made):
-    """One full pass over the AZs. Mutates held/made in place.
-
-    Grabs at most ONE instance per AZ per pass; the --watch loop repeats sweeps
-    to accumulate toward the target (so capacity that trickles out gets caught).
-    """
-    throttle_attempt = 0
-    for az in azs:
-        if sum(held.values()) >= args.target_count:
-            return
-        if _az_full(args, held, az):
-            continue  # balanced mode: this AZ already at its per-AZ cap
-        if az not in offered:
-            continue  # g7e.48xlarge not offered in this AZ — skip
-        try:
-            resp = reserve_one(client, az, not args.live, args.end_hours)
-            crid = resp["CapacityReservation"]["CapacityReservationId"]
-            _on_grab(args, crid, az, held, made)
-            throttle_attempt = 0
-        except ClientError as e:
-            kind = classify(e)
-            if kind == "dryrun_ok":
-                log.info("[dry-run] would reserve %s @ %s (+1 instance)",
-                         INSTANCE_TYPE, az)
-                _on_grab(args, "(dry-run)", az, held, made)
-            elif kind == "capacity":
-                log.info("no capacity: %s @ %s — next", INSTANCE_TYPE, az)
-            elif kind == "throttle":
-                log.warning("throttled, backing off (attempt %d)", throttle_attempt)
-                backoff_sleep(throttle_attempt)
-                throttle_attempt += 1
-            else:
-                log.error("FATAL on %s @ %s: %s", INSTANCE_TYPE, az,
-                          e.response["Error"])
-                raise
-
-
-def _resolved_target(args):
-    """Best-effort instance target WITHOUT touching AWS, mirroring run()'s rule.
-
-    Used by --check-quota and --list: treat the placeholder default as unset;
-    in balanced mode with explicit --azs, derive total = per_az x #--azs.
-    Returns None when no target can be determined.
-    """
-    tgt = None if args.target_count == DEFAULT_TARGET else args.target_count
-    if args.per_az_count and tgt is None and args.azs:
-        tgt = args.per_az_count * len(args.azs)
-    return tgt
-
-
-def report_quota(args):
-    """--check-quota: print the live G/VT vCPU quota and whether it covers the
-    target. Pure preflight — reads Service Quotas, reserves nothing.
-    """
+# --------------------------------------------------------------------------- #
+# quota preflight
+# --------------------------------------------------------------------------- #
+def report_quota(args, type_targets):
+    """--check-quota: print the shared G/VT vCPU quota vs the planned counts."""
     from quota import (
-        service_quotas_client, check_quota, get_g_vt_quota, vcpus_needed,
-        max_instances_for, G_VT_QUOTA_NAME, G_VT_QUOTA_CODE,
+        service_quotas_client, get_g_vt_quota, vcpus_for_counts,
+        G_VT_QUOTA_NAME, G_VT_QUOTA_CODE,
     )
     sq = service_quotas_client(args.region)
     current = get_g_vt_quota(sq)
+    needed = vcpus_for_counts(type_targets)
     log.info("G/VT On-Demand quota (%s, %s) in %s: %g vCPU",
              G_VT_QUOTA_NAME, G_VT_QUOTA_CODE, args.region, current)
-    log.info("  -> allows up to %d x %s (%d vCPU each)",
-             max_instances_for(current), INSTANCE_TYPE, VCPU_PER)
-    tgt = _resolved_target(args)
-    if tgt:
-        needed = vcpus_needed(tgt)
-        ok = current >= needed
-        log.info("  target %d instance(s) needs %d vCPU -> %s",
-                 tgt, needed, "OK" if ok else "INSUFFICIENT")
-        if not ok:
-            log.warning("quota too low — request an increase first. See 配额.md")
-    else:
-        log.info("  (pass --target-count or --per-az-count + --azs to check a "
-                 "specific target)")
+    for t in sorted(type_targets):
+        log.info("  plan: %d x %s = %d vCPU",
+                 type_targets[t], t, type_targets[t] * VCPU[t])
+    ok = current >= needed
+    log.info("  total needed %d vCPU vs current %g -> %s",
+             needed, current, "OK" if ok else "INSUFFICIENT")
+    if not ok:
+        log.warning("quota too low — request an increase first. See 配额.md")
+
+
+# --------------------------------------------------------------------------- #
+# run / main
+# --------------------------------------------------------------------------- #
+def _validate_modes(args):
+    """Reject conflicting target specs early (clear error over silent surprise)."""
+    if args.az_counts and args.counts:
+        raise ValueError("use either --az-counts OR --counts, not both")
+    if args.balance and not args.counts:
+        raise ValueError("--balance only applies with --counts")
+    if args.az_counts and args.azs:
+        log.warning("--azs is ignored when --az-counts is given "
+                    "(AZs come from the TYPE@AZ keys)")
+
+
+def _need_region_azs(args):
+    """Do we have to ask AWS for the region's AZ list to resolve the plan?
+    Only when AZs aren't given explicitly and we're not in --az-counts mode."""
+    return not args.az_counts and not args.azs
 
 
 def run(args):
+    _validate_modes(args)
+
     if args.check_quota:
-        report_quota(args)
+        all_azs = list_azs(ec2_client(args.region)) if _need_region_azs(args) else []
+        _cells, type_targets = build_plan(args, all_azs)
+        report_quota(args, type_targets)
+        return
+
+    if args.list:
+        # Prefer an explicitly-passed plan; otherwise fall back to the saved
+        # plan file (so plain --list shows progress).
+        if args.az_counts or args.counts or args.per_az_count is not None \
+                or args.target_count != DEFAULT_TARGET:
+            all_azs = list_azs(ec2_client(args.region)) if _need_region_azs(args) else []
+            cells, type_targets = build_plan(args, all_azs)
+            print_list(ec2_client(args.region), cells, type_targets)
+        else:
+            print_list(ec2_client(args.region))
         return
 
     client = ec2_client(args.region)
-
-    if args.list:
-        # Targets are read automatically from grabs.jsonl inside print_list,
-        # so plain --list shows progress. If the caller DID pass them, prefer
-        # those (same resolution rule as --check-quota).
-        tgt = _resolved_target(args)
-        per_az = args.per_az_count
-        if tgt is None and per_az is None:
-            print_list(client)                       # auto-read from ledger
-        else:
-            print_list(client, target_count=tgt, per_az_count=per_az)
-        return
 
     if args.cancel_all:
         cancel_all(client, not args.live)
         return
 
-    log.info("region=%s type=%s dry_run=%s target_count=%d end_hours=%s watch=%s",
-             args.region, INSTANCE_TYPE, not args.live, args.target_count,
-             args.end_hours, args.watch)
-
     all_azs = list_azs(client)
-    offered = offered_in_azs(client)
+    offered = offered_by_az(client, SUPPORTED_TYPES)
+    cells, type_targets = build_plan(args, all_azs)
 
-    # Lock the sweep to --azs if given, else use every AZ in the region.
-    # ODCR needs NO subnet, so any available AZ works.
-    azs, missing = resolve_azs(all_azs, args.azs)
+    # Validate AZ existence + offering; warn (don't crash) on problems.
+    plan_azs = sorted({az for (_t, az) in cells})
+    _sel, missing = resolve_azs(all_azs, plan_azs)
     if missing:
-        log.warning("requested AZs not present in %s (ignored): %s",
+        log.warning("requested AZs not present in %s (cells will be skipped): %s",
                     args.region, missing)
-    if not azs:
-        log.error("no usable AZs after applying --azs %s — nothing to do", args.azs)
-        return
-    not_offered = [az for az in azs if az not in offered]
+    not_offered = sorted({(t, az) for (t, az) in cells
+                          if (t, az) not in offered})
     if not_offered:
-        log.warning("%s not offered in these target AZs (will skip): %s",
-                    INSTANCE_TYPE, not_offered)
-    log.info("target AZs: %s", azs)
+        log.warning("these (type,az) cells are NOT offered (will skip): %s",
+                    ["%s@%s" % (t, az) for (t, az) in not_offered])
+    if not cells:
+        log.error("empty plan — nothing to do")
+        return
 
-    # BALANCED mode: if --per-az-count is set and --target-count was left at the
-    # default, auto-compute the total as per_az_count * number-of-AZs so the
-    # caller only has to supply ONE number.
-    if args.per_az_count is not None:
-        auto_total = args.per_az_count * len(azs)
-        if args.target_count == DEFAULT_TARGET:  # untouched default
-            args.target_count = auto_total
-            log.info("balanced mode: per-az cap %d x %d AZ -> target %d instances",
-                     args.per_az_count, len(azs), args.target_count)
-        elif args.target_count != auto_total:
-            log.warning("balanced mode: --target-count %d != per-az %d x %d AZ "
-                        "(%d); using --target-count as the hard overall stop",
-                        args.target_count, args.per_az_count, len(azs), auto_total)
+    log.info("region=%s dry_run=%s watch=%s", args.region, not args.live, args.watch)
+    for t in sorted(type_targets):
+        log.info("  plan %s: target %d, cells %s", t, type_targets[t],
+                 {az: cells[(t, az)] for (tt, az) in cells if tt == t})
+    grand_target = sum(type_targets.values())
+    log.info("  GRAND target: %d instance(s)", grand_target)
 
-    made = []  # reservations created in THIS process (for end-of-run listing)
+    if args.live:
+        save_plan(cells, type_targets, args.region)
 
-    # held = per-AZ instances we ACTUALLY hold, the stop-gate's source of truth.
-    # LIVE: seed from AWS so a restart resumes exactly where we left off.
-    # dry-run: start empty and simulate locally so the plan preview is clean.
-    #
-    # IMPORTANT: count ONLY the AZs we're sweeping (only_azs=set(azs)). If you
-    # target one AZ (--azs us-east-1d) but already hold stock in another
-    # (us-east-1b), that out-of-scope stock would inflate the TOTAL gate and
-    # stop the run before the targeted AZ is filled.
-    held = held_count_by_az(client, only_azs=set(azs)) if args.live else {}
+    made = []
+    scope = set(cells)
+    # held = per-cell instances ACTUALLY held (gate's source of truth).
+    # LIVE: seed from AWS so a restart resumes; dry-run: simulate locally.
+    held = held_by_type_az(client, scope=scope) if args.live else {}
     if args.live and held:
-        log.info("resumed from AWS: %d instance(s) already held in target AZs %s",
-                 sum(held.values()), held)
+        log.info("resumed from AWS: %d instance(s) already held %s",
+                 grand_held(held), {("%s@%s" % k): v for k, v in held.items()})
 
     if args.watch:
-        log.info("WATCH mode: re-sweeping every %ds until %d instance(s) reserved "
-                 "(Ctrl-C to stop)", args.interval, args.target_count)
+        log.info("WATCH mode: re-sweeping every %ds until %d instance(s) "
+                 "reserved (Ctrl-C to stop)", args.interval, grand_target)
         rounds = 0
-        while sum(held.values()) < args.target_count:
+        while not _all_done(type_targets, held):
             rounds += 1
-            # Re-read AWS truth each round (live): this is what makes the watch
-            # loop self-correcting and restart-safe — per-AZ caps are always
-            # judged against what we really hold right now. Same AZ-scope filter
-            # as the seed above.
             if args.live:
-                held = held_count_by_az(client, only_azs=set(azs))
-            log.info("--- watch round %d (have %d/%d instances | per-AZ %s) ---",
-                     rounds, sum(held.values()), args.target_count, held)
-            sweep_once(client, args, azs, offered, held, made)
-            if sum(held.values()) >= args.target_count:
+                held = held_by_type_az(client, scope=scope)
+            log.info("--- watch round %d (have %d/%d instances) ---",
+                     rounds, grand_held(held), grand_target)
+            sweep_once(client, args, cells, type_targets, offered, held, made)
+            if _all_done(type_targets, held):
                 break
             time.sleep(args.interval)
         log.info("WATCH target reached after %d round(s)", rounds)
     else:
-        sweep_once(client, args, azs, offered, held, made)
+        sweep_once(client, args, cells, type_targets, offered, held, made)
 
-    log.info("=== DONE: holding %d/%d instance(s) (this run created %d reservation(s)) ===",
-             sum(held.values()), args.target_count, len(made))
-    if args.per_az_count is not None:
-        for az in azs:
-            got = held.get(az, 0)
-            flag = "FULL" if got >= args.per_az_count else "short"
-            log.info("  per-AZ %s: %d/%d instance(s) [%s]",
-                     az, got, args.per_az_count, flag)
-    for crid, t, a in made:
-        log.info("  %s %s @ %s", crid, t, a)
+    log.info("=== DONE: holding %d/%d instance(s) (this run created %d) ===",
+             grand_held(held), grand_target, len(made))
+    for t in sorted(type_targets):
+        tot = type_held(held, t)
+        flag = "FULL" if tot >= type_targets[t] else "short"
+        log.info("  %s: %d/%d [%s]", t, tot, type_targets[t], flag)
+    for crid, ty, a in made:
+        log.info("  %s %s @ %s", crid, ty, a)
     if not args.live:
         log.info("(dry-run — nothing was actually reserved, no billing)")
     else:
@@ -460,27 +568,32 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Grab g7e.48xlarge via On-Demand Capacity Reservations "
-                    "(count-based)")
+        description="Grab G-series (g6e + g7e) via On-Demand Capacity "
+                    "Reservations (count-based, multi-type)")
     p.add_argument("--region", default=DEFAULT_REGION,
                    help="AWS region to target (default %s)" % DEFAULT_REGION)
-    p.add_argument("--target-count", type=int, default=DEFAULT_TARGET,
-                   help="stop once this many g7e.48xlarge instances are held "
-                        "(default %d). If --per-az-count is set and this is left "
-                        "at default, the total is auto-computed as "
-                        "per-az-count x number-of-AZs." % DEFAULT_TARGET)
-    p.add_argument("--per-az-count", type=int, default=None,
-                   help="BALANCED mode: cap EACH AZ at this many instances. The "
-                        "cap is checked against instances actually held in that "
-                        "AZ (read from AWS each round), so the sweep skips any AZ "
-                        "already at its cap and keeps hunting the rest — "
-                        "reservations stay even across --azs AND a restart "
-                        "resumes per-AZ correctly. e.g. --azs us-east-1b "
-                        "us-east-1d --per-az-count 2 caps each AZ at 2 instances, "
-                        "4 total.")
+    p.add_argument("--counts", nargs="*", metavar="TYPE=N",
+                   help="per-type TOTAL instance targets, e.g. "
+                        "--counts g6e.48xlarge=10 g7e.48xlarge=20. "
+                        "Combine with --azs (and optionally --balance).")
+    p.add_argument("--az-counts", nargs="*", metavar="TYPE@AZ=N",
+                   help="EXPLICIT per-(type,az) instance counts (may differ per "
+                        "AZ/type), e.g. --az-counts g7e.48xlarge@us-east-1b=5 "
+                        "g6e.48xlarge@us-east-1d=10. AZs are taken from the keys.")
+    p.add_argument("--balance", action="store_true",
+                   help="with --counts: spread each type's total EVENLY across "
+                        "--azs (per-AZ cap = ceil/floor of total/#AZ)")
     p.add_argument("--azs", nargs="*",
-                   help="lock to these AZ names, e.g. --azs us-east-1b us-east-1d "
-                        "(default: every AZ in the region)")
+                   help="AZ names for --counts/compat modes, e.g. --azs "
+                        "us-east-1b us-east-1d (default: every AZ in the region)")
+    # Backward-compatible single-type (g7e.48xlarge) flags:
+    p.add_argument("--target-count", type=int, default=DEFAULT_TARGET,
+                   help="[compat] single-type %s total target (default %d). "
+                        "Used only when neither --counts nor --az-counts is given."
+                        % (DEFAULT_TYPE, DEFAULT_TARGET))
+    p.add_argument("--per-az-count", type=int, default=None,
+                   help="[compat] single-type %s per-AZ cap; with default "
+                        "--target-count, total auto = per-az x #AZ." % DEFAULT_TYPE)
     p.add_argument("--end-hours", type=float, default=None,
                    help="auto-expire reservations after N hours (billing guard)")
     p.add_argument("--watch", action="store_true",
@@ -492,14 +605,17 @@ def main():
     p.add_argument("--cancel-all", action="store_true",
                    help="cancel all reservations tagged %s=%s" % (TAG_KEY, TAG_VAL))
     p.add_argument("--list", action="store_true",
-                   help="list current reservations + per-AZ/total instance "
-                        "summary (auto-reads target from grabs.jsonl), then exit")
+                   help="list reservations + per-(type,az)/type/grand summary "
+                        "(auto-reads plan from logs/plan.json), then exit")
     p.add_argument("--check-quota", action="store_true",
-                   help="check the G/VT On-Demand vCPU quota against the target "
+                   help="check the shared G/VT vCPU quota against the plan "
                         "(reads Service Quotas, reserves nothing), then exit")
     args = p.parse_args()
     try:
         run(args)
+    except ValueError as e:
+        log.error("%s", e)
+        sys.exit(2)
     except KeyboardInterrupt:
         log.info("interrupted — stopping watch")
     except ClientError as e:

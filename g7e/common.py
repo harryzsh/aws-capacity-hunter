@@ -1,12 +1,15 @@
-"""Shared helpers for the g7e.48xlarge capacity-grab script.
+"""Shared helpers for the G-series (g6e + g7e) capacity-grab script.
 
 grab_g7e_odcr.py imports from here.
 Region is configurable via --region (default: us-east-1).
 
-DESIGN NOTE — this is the COUNT-BASED sibling of the repo's i4i grabber.
-The i4i version counts vCPU (cores); this one counts INSTANCES (台数). There
-is exactly one instance type (g7e.48xlarge), so there is no vCPU table and no
-large-first type sorting — every unit is "one g7e.48xlarge".
+DESIGN NOTE — this is the COUNT-BASED, MULTI-TYPE grabber for the EC2 G family.
+You grab a specified number of EACH type, optionally with explicit per-AZ
+counts that differ per type. Everything is counted in INSTANCES (台数), and the
+target is a matrix:  (instance_type, az) -> desired instance count.
+
+Both supported sizes are .48xlarge (192 vCPU, 8 GPU) and both live in the same
+"Running On-Demand G and VT instances" quota — see quota.py / 配额.md.
 """
 import os
 import json
@@ -21,22 +24,28 @@ from botocore.exceptions import ClientError
 
 DEFAULT_REGION = "us-east-1"
 
-# The ONLY instance type this grabber reserves. Single-type by requirement —
-# no size fallback. VCPU_PER is informational only (logging/quota math); the
-# stop-gates count INSTANCES, not cores.
-INSTANCE_TYPE = "g7e.48xlarge"
-VCPU_PER = 192
+# vCPU per supported instance type. Used for quota math and logging — the
+# stop-gates count INSTANCES, not cores. Fixed to the two .48xlarge G-series
+# sizes by requirement (no size fallback).
+VCPU = {
+    "g6e.48xlarge": 192,
+    "g7e.48xlarge": 192,
+}
+SUPPORTED_TYPES = sorted(VCPU)          # ["g6e.48xlarge", "g7e.48xlarge"]
+# The type used by the backward-compatible single-type flags
+# (--target-count / --per-az-count) when no --counts/--az-counts is given.
+DEFAULT_TYPE = "g7e.48xlarge"
 
 # Tag stamped on every reservation we create, so --list / --cancel-all /
-# held_count_by_az can find exactly ours. Distinct from the i4i grabber's tag
-# so the two never collide in the same account.
+# held_count can find exactly ours. Covers both g6e and g7e.
 TAG_KEY = "purpose"
-TAG_VAL = "g7e-grab"
+TAG_VAL = "g-grab"
 
-# All logs/ledgers live next to the scripts, regardless of cwd.
+# All logs/ledgers/state live next to the scripts, regardless of cwd.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 GRAB_LEDGER = os.path.join(LOGS_DIR, "grabs.jsonl")
+PLAN_FILE = os.path.join(LOGS_DIR, "plan.json")
 
 # Errors that just mean "no capacity here, move on" — NOT a script failure.
 CAPACITY_ERRORS = {
@@ -57,7 +66,7 @@ def setup_logging(logfile=None):
     logfile: base name like 'grab_g7e_odcr.log'. Written under logs/ with
              rotation (5 MB x 5 backups) so it never fills the disk.
     """
-    logger = logging.getLogger("g7e-grab")
+    logger = logging.getLogger("g-grab")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fmt = logging.Formatter(
@@ -79,19 +88,22 @@ def setup_logging(logfile=None):
     return logger
 
 
-def record_grab(via, az, count, total_count, target_count, region, dry_run,
-                per_az_count=None, per_az_total=None):
+def record_grab(via, itype, az, count, type_total, type_target, region,
+                dry_run, az_cap=None, az_total=None, grand_total=None,
+                grand_target=None):
     """Append one JSON line to the ledger every time we secure capacity.
 
     Machine-readable feed for downstream tooling (parsers, dashboards, etc.).
     Skipped during dry-run so the ledger only ever holds real grabs.
 
+    itype:        the instance type secured (g6e.48xlarge / g7e.48xlarge).
     count:        instances secured by THIS grab (always 1 — one ODCR per call).
-    total_count:  total instances held across all in-scope AZs after this grab.
-    target_count: the overall instance target we're grabbing toward.
-    per_az_count: the --per-az-count cap in effect (None if not balanced mode).
-    per_az_total: instances held in THIS az after this grab (so the ledger
-                  shows how a balanced run progresses per AZ, not just total).
+    type_total:   total instances of THIS type held after this grab.
+    type_target:  overall instance target for this type.
+    az_cap:       per-(type,az) cap in effect (None if no per-AZ cap).
+    az_total:     instances of this type held in THIS az after this grab.
+    grand_total:  total instances held across ALL types after this grab.
+    grand_target: total instances targeted across ALL types.
     """
     if dry_run:
         return
@@ -99,17 +111,55 @@ def record_grab(via, az, count, total_count, target_count, region, dry_run,
     rec = {
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "via": via,                       # "odcr"
-        "instance_type": INSTANCE_TYPE,
+        "instance_type": itype,
         "az": az,
         "region": region,
         "count": count,                   # instances this grab (1)
-        "total_count": total_count,       # total instances held after this grab
-        "target_count": target_count,     # overall instance target
-        "per_az_count": per_az_count,     # cap per AZ (null = not balanced mode)
-        "per_az_total": per_az_total,     # instances held in this AZ after grab
+        "type_total": type_total,         # this type held after this grab
+        "type_target": type_target,       # this type's overall target
+        "az_cap": az_cap,                 # per-(type,az) cap (null = none)
+        "az_total": az_total,             # this type held in this az after grab
+        "grand_total": grand_total,       # all types held after this grab
+        "grand_target": grand_target,     # all types targeted
     }
     with open(GRAB_LEDGER, "a") as f:
         f.write(json.dumps(rec) + "\n")
+
+
+def save_plan(cells, type_targets, region):
+    """Persist the resolved plan so `--list` can show progress without
+    re-typing it. `cells` is {(type,az): cap_or_None}; `type_targets` is
+    {type: total}. Keys are stored as 'type@az' strings (JSON has no tuple
+    keys). Callers pass it only on live runs.
+    """
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    data = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "region": region,
+        "cells": {"%s@%s" % (t, az): cap for (t, az), cap in cells.items()},
+        "type_targets": dict(type_targets),
+    }
+    with open(PLAN_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_plan():
+    """Read the last saved plan. Returns (cells, type_targets):
+      cells        -> {(type,az): cap_or_None}
+      type_targets -> {type: total}
+    Both empty if no plan file. So plain `--list` can show progress.
+    """
+    try:
+        with open(PLAN_FILE) as f:
+            data = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}, {}
+    cells = {}
+    for key, cap in data.get("cells", {}).items():
+        if "@" in key:
+            t, az = key.split("@", 1)
+            cells[(t, az)] = cap
+    return cells, dict(data.get("type_targets", {}))
 
 
 def ec2_client(region=DEFAULT_REGION):
@@ -120,7 +170,7 @@ def resolve_azs(all_azs, requested):
     """Lock the sweep to a caller-supplied AZ list.
 
     all_azs:   AZ names actually available in the region (from list_azs).
-    requested: AZ names passed via --azs (e.g. ['us-east-1b','us-east-1d']);
+    requested: AZ names (e.g. ['us-east-1b','us-east-1d']);
                None/empty means "use every available AZ".
     Returns (selected_azs, missing) where missing are requested AZs that don't
     exist in the region (so the caller can warn instead of silently dropping).
@@ -141,18 +191,18 @@ def list_azs(client):
     return sorted(z["ZoneName"] for z in resp["AvailabilityZones"])
 
 
-def offered_in_azs(client):
-    """The set of AZ names where g7e.48xlarge is actually offered.
+def offered_by_az(client, types):
+    """Set of (instance_type, az) combos actually offered, so we skip
+    guaranteed-fail CreateCapacityReservation calls.
 
-    Single-type version of the i4i offered_types_by_az: we only ever reserve
-    INSTANCE_TYPE, so we just need to know which AZs can hold it and skip the
-    rest (avoids guaranteed-fail CreateCapacityReservation calls).
+    types: iterable of instance types to query (our supported set).
     """
     resp = client.describe_instance_type_offerings(
         LocationType="availability-zone",
-        Filters=[{"Name": "instance-type", "Values": [INSTANCE_TYPE]}],
+        Filters=[{"Name": "instance-type", "Values": list(types)}],
     )
-    return {o["Location"] for o in resp["InstanceTypeOfferings"]}
+    return {(o["InstanceType"], o["Location"])
+            for o in resp["InstanceTypeOfferings"]}
 
 
 def backoff_sleep(attempt, base=1.0, cap=20.0):

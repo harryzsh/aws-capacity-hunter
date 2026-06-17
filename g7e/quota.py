@@ -1,9 +1,9 @@
-"""G/VT On-Demand vCPU quota preflight for the g7e.48xlarge grabber.
+"""G/VT On-Demand vCPU quota preflight for the G-series (g6e + g7e) grabber.
 
-g7e belongs to the EC2 **G** family, so the relevant Service Quota is
-"Running On-Demand G and VT instances" (quota code L-DB2E81BA), measured in
-**vCPUs** — NOT instance count. Each g7e.48xlarge is 192 vCPU, so to hold N
-instances you need a quota of at least 192 x N.
+g6e and g7e both belong to the EC2 **G** family, so they share ONE Service
+Quota: "Running On-Demand G and VT instances" (quota code L-DB2E81BA), measured
+in **vCPUs** — NOT instance count. Each .48xlarge is 192 vCPU, so the total
+vCPU you need is the sum over every type of (count x 192).
 
 This module is the small, testable core behind `grab_g7e_odcr.py --check-quota`.
 The functions take an injected boto3 service-quotas client so they can be unit
@@ -14,7 +14,7 @@ does NOT guarantee capacity — you still have to grab an ODCR. See 配额.md.
 """
 import boto3
 
-from common import DEFAULT_REGION, INSTANCE_TYPE, VCPU_PER
+from common import DEFAULT_REGION, VCPU
 
 # Service Quotas identifiers for the G/VT On-Demand vCPU limit.
 SERVICE_CODE = "ec2"
@@ -27,14 +27,12 @@ def service_quotas_client(region=DEFAULT_REGION):
     return boto3.client("service-quotas", region_name=region)
 
 
-def vcpus_needed(count):
-    """vCPUs required to run `count` g7e.48xlarge instances (192 each)."""
-    return count * VCPU_PER
+def vcpus_for_counts(counts):
+    """vCPUs required for a {instance_type: count} map (sum of count x vCPU).
 
-
-def max_instances_for(vcpu_quota):
-    """How many whole g7e.48xlarge a given vCPU quota allows."""
-    return int(vcpu_quota // VCPU_PER)
+    Unknown types contribute 0 (caller validates types elsewhere).
+    """
+    return sum(VCPU.get(t, 0) * n for t, n in counts.items())
 
 
 def get_g_vt_quota(client):
@@ -49,25 +47,24 @@ def get_g_vt_quota(client):
     return resp["Quota"]["Value"]
 
 
-def check_quota(client, target_count):
-    """Preflight the G/VT quota against a desired instance target.
+def check_quota(client, counts):
+    """Preflight the shared G/VT quota against a desired {type: count} map.
 
     Returns a dict:
       current_vcpu   - applied G/VT vCPU quota
-      needed_vcpu    - 192 * target_count
-      max_instances  - how many g7e.48xlarge the current quota allows
-      target_count   - echoed input
+      needed_vcpu    - sum over types of count x 192
+      counts         - echoed input map
+      per_type_vcpu  - {type: count x vCPU}
       sufficient     - True if current_vcpu >= needed_vcpu
     """
     current = get_g_vt_quota(client)
-    needed = vcpus_needed(target_count)
+    needed = vcpus_for_counts(counts)
     return {
-        "instance_type": INSTANCE_TYPE,
         "quota_code": G_VT_QUOTA_CODE,
         "quota_name": G_VT_QUOTA_NAME,
         "current_vcpu": current,
         "needed_vcpu": needed,
-        "max_instances": max_instances_for(current),
-        "target_count": target_count,
+        "counts": dict(counts),
+        "per_type_vcpu": {t: VCPU.get(t, 0) * n for t, n in counts.items()},
         "sufficient": current >= needed,
     }
