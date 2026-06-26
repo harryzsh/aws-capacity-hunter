@@ -96,7 +96,17 @@ python3 grab_g7e_odcr.py --check-quota --counts g6e.48xlarge=10 g7e.48xlarge=20
 
 ## 24×7 在 EC2 上跑（systemd）
 
+> ⚠️ **下面两行必须改成你这台机器的真实用户和路径**，否则 systemd 会报 `status=217/USER` 一直崩溃重启：
+> - `User=` → 你的登录用户：**Amazon Linux 是 `ec2-user`，Ubuntu 是 `ubuntu`**（不确定就跑 `whoami`）。
+> - `WorkingDirectory=` → 仓库 `g7e` 目录的真实路径（如 `/home/ubuntu/ec2-i4i-capacity-grabber/g7e`，用 `pwd` 确认）。
+>
+> ⚠️ **heredoc 别缩进**：下面整段每一行都要**顶格**，尤其结尾的 `EOF` 必须在行首、前面不能有空格——否则 shell 认不出结束符，`tee` 写不进去（你会看到一直出 `>` 提示符），文件根本没更新。
+
 ```bash
+# 先确认用户和路径（把结果填进下面的 User= 和 WorkingDirectory=）
+whoami        # -> ec2-user 或 ubuntu
+pwd           # -> 例如 /home/ubuntu/ec2-i4i-capacity-grabber/g7e
+
 sudo tee /etc/systemd/system/grab-g-odcr.service > /dev/null <<'EOF'
 [Unit]
 Description=g6e/g7e ODCR capacity grabber (count-based, multi-type)
@@ -105,8 +115,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ec2-user
-WorkingDirectory=/home/ec2-user/ec2-i4i-capacity-grabber/g7e
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ec2-i4i-capacity-grabber/g7e
 ExecStart=/usr/bin/python3 grab_g7e_odcr.py --az-counts g7e.48xlarge@us-east-1b=5 g7e.48xlarge@us-east-1d=3 g6e.48xlarge@us-east-1b=2 g6e.48xlarge@us-east-1d=10 --live --watch --interval 30
 Restart=always
 RestartSec=10
@@ -116,10 +126,16 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 EOF
 
+# 写完先核对这两行是否是你机器的真实值
+grep -E 'User=|WorkingDirectory=' /etc/systemd/system/grab-g-odcr.service
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now grab-g-odcr
-sudo systemctl status grab-g-odcr
+sudo systemctl status grab-g-odcr --no-pager
 ```
+
+> 启动后用 `journalctl -u grab-g-odcr -f` 确认没有 `217/USER`，并看到 `WATCH mode ...` 才算真正跑起来。
+> 改过 `User=`/路径后想重新生效，记得 `sudo systemctl daemon-reload && sudo systemctl restart grab-g-odcr`。
 
 **结束时先停、再释放（这一步才停计费）：**
 ```bash
