@@ -131,6 +131,62 @@ def held_cores_by_az(client, only_azs=None):
     return held
 
 
+def parse_per_type(pairs):
+    """Parse --per-type 'TYPE:COUNT' tokens into an ordered {type: count} dict.
+
+    PER-TYPE mode: each entry is an INDEPENDENT instance-count target — grab
+    exactly COUNT instances of TYPE, judged on its own. A dry type never blocks
+    the others, and there is NO shared core target and NO per-AZ balancing (we
+    grab wherever the type has capacity). This is separate from the core-target
+    / --per-az-cores machinery and does not touch it.
+
+    Accepts 'i4i.16xlarge:10'. COUNT must be a positive integer. A later
+    duplicate of the same type wins (last-write) so a typo can be re-stated.
+    Returns (targets, errors): targets is an Ordered(dict), errors a list of
+    human-readable strings for tokens we couldn't use (caller warns/aborts).
+    """
+    targets, errors = {}, []
+    for tok in pairs or []:
+        if ":" not in tok:
+            errors.append("%r: expected TYPE:COUNT" % tok)
+            continue
+        itype, _, cnt = tok.rpartition(":")
+        itype = itype.strip()
+        if not itype:
+            errors.append("%r: empty instance type" % tok)
+            continue
+        try:
+            n = int(cnt)
+        except ValueError:
+            errors.append("%r: count %r is not an integer" % (tok, cnt))
+            continue
+        if n <= 0:
+            errors.append("%r: count must be > 0" % tok)
+            continue
+        targets[itype] = n   # last-write-wins on duplicate type
+    return targets, errors
+
+
+def held_count_by_type(client, types):
+    """Sum instances held per type across THIS script's tagged reservations,
+    read LIVE from AWS. Counts INSTANCES (TotalInstanceCount), not cores and
+    not reservation objects — per-type mode targets are in instance count.
+
+    types: the set/dict of types we care about; others are ignored so unrelated
+        tagged reservations never inflate a per-type gate.
+
+    This is the per-type stop-gate's source of truth. Re-reading it every round
+    is what makes restarts safe: after a crash we see exactly how many of each
+    type we already hold and only top up the real shortfall — never double-grab.
+    """
+    held = {}
+    for _crid, itype, az, _state, cnt, tag, _avail in list_reservations(client):
+        if tag != TAG_VAL or itype not in types:
+            continue
+        held[itype] = held.get(itype, 0) + (cnt or 1)
+    return held
+
+
 def _targets_from_ledger():
     """Read the most recent (target_vcpu, per_az_cores) from grabs.jsonl.
 
@@ -301,6 +357,156 @@ def sweep_once(client, args, azs, offered, held, made):
                     raise
 
 
+def _on_grab_type(args, crid, itype, az, held, made):
+    """Bookkeeping for one secured reservation in PER-TYPE mode: bump the held
+    instance count for this type, log, and append to the ledger.
+
+    held is {type: instances}, the per-type gate (seeded from AWS truth each
+    round); we bump it locally so the gate stays accurate WITHIN a sweep,
+    between AWS re-reads — same idempotency contract as _on_grab, but the unit
+    is instances of a type instead of cores in an AZ.
+    """
+    held[itype] = held.get(itype, 0) + 1
+    made.append((crid, itype, az))
+    tgt = args.per_type[itype]
+    log.info("RESERVED %s %s @ %s (%s: %d/%d instances)",
+             crid, itype, az, itype, held[itype], tgt)
+    # Ledger stays core-denominated (vcpu/total_vcpu) so --list and downstream
+    # tooling read it uniformly. total_vcpu here is this type's held cores.
+    vcpu = VCPU.get(itype, 0)
+    record_grab("odcr", itype, az, vcpu, held[itype] * vcpu,
+                tgt * vcpu, args.region, not args.live)
+
+
+def sweep_once_per_type(client, args, azs, offered, held, made):
+    """One PER-TYPE pass: for each type still short of its own instance-count
+    target, grab count=1 across the AZs (cycling AZs) until that type is full
+    or its AZs are exhausted this pass. Mutates held/made in place.
+
+    Each type is judged on its OWN target from --per-type: a dry type is simply
+    skipped, it never stops the others. No shared core gate, no per-AZ cap.
+    """
+    throttle_attempt = 0
+    for itype in args.per_type:
+        target = args.per_type[itype]
+        # Loop AZs repeatedly until this type hits its target or a full pass
+        # over the AZs grabs nothing (capacity exhausted for it right now).
+        while held.get(itype, 0) < target:
+            progressed = False
+            for az in azs:
+                if held.get(itype, 0) >= target:
+                    break
+                if (itype, az) not in offered:
+                    continue
+                try:
+                    resp = reserve_one(client, itype, az, not args.live, args.end_hours)
+                    crid = resp["CapacityReservation"]["CapacityReservationId"]
+                    _on_grab_type(args, crid, itype, az, held, made)
+                    progressed = True
+                    throttle_attempt = 0
+                except ClientError as e:
+                    kind = classify(e)
+                    if kind == "dryrun_ok":
+                        log.info("[dry-run] would reserve %s @ %s (1 instance)",
+                                 itype, az)
+                        _on_grab_type(args, "(dry-run)", itype, az, held, made)
+                        progressed = True
+                    elif kind == "capacity":
+                        log.info("no capacity: %s @ %s — next", itype, az)
+                    elif kind == "throttle":
+                        log.warning("throttled, backing off (attempt %d)", throttle_attempt)
+                        backoff_sleep(throttle_attempt)
+                        throttle_attempt += 1
+                        progressed = True  # retry same target, don't call it dry
+                    else:
+                        log.error("FATAL on %s @ %s: %s", itype, az, e.response["Error"])
+                        raise
+            if not progressed:
+                # A full AZ pass grabbed nothing and wasn't throttled: this type
+                # has no capacity anywhere right now. Stop hammering it — the
+                # --watch loop will retry next round.
+                log.info("%s: no capacity in any target AZ this pass "
+                         "(%d/%d) — moving on", itype, held.get(itype, 0), target)
+                break
+
+
+def _run_per_type(args, client):
+    """PER-TYPE mode entry point, called from run() when --per-type is set.
+
+    Independent instance-count target per type; --target-cores / --per-az-cores
+    are ignored here (run() warns). Learns vCPU for any non-table type so the
+    ledger/summary stay core-consistent, resolves offered (type, az) combos, and
+    seeds held counts from AWS so a restart resumes per type.
+    """
+    types = list(args.per_type)
+    added, unresolvable = ensure_vcpu(client, types)
+    if added:
+        log.info("learned vCPU from AWS for new types: %s", added)
+    if unresolvable:
+        log.warning("AWS could not resolve these instance types (dropped): %s",
+                    unresolvable)
+        for t in unresolvable:
+            args.per_type.pop(t, None)
+        types = list(args.per_type)
+    if not types:
+        log.error("no usable instance types in --per-type — nothing to do")
+        return
+
+    all_azs = list_azs(client)
+    azs, missing = resolve_azs(all_azs, args.azs)
+    if missing:
+        log.warning("requested AZs not present in %s (ignored): %s", args.region, missing)
+    if not azs:
+        log.error("no usable AZs after applying --azs %s — nothing to do", args.azs)
+        return
+    offered = offered_types_by_az(client, types)
+
+    log.info("PER-TYPE mode: targets=%s  AZs=%s",
+             {t: args.per_type[t] for t in types}, azs)
+
+    def _done(held):
+        return all(held.get(t, 0) >= args.per_type[t] for t in types)
+
+    made = []
+    # LIVE: seed from AWS so a restart resumes each type where it left off.
+    # dry-run: start empty and simulate locally for a clean plan preview.
+    held = held_count_by_type(client, args.per_type) if args.live else {}
+    if args.live and held:
+        log.info("resumed from AWS: already hold %s", held)
+
+    if args.watch:
+        log.info("WATCH mode: re-sweeping every %ds until every type hits its "
+                 "target (Ctrl-C to stop)", args.interval)
+        rounds = 0
+        while not _done(held):
+            rounds += 1
+            if args.live:
+                held = held_count_by_type(client, args.per_type)
+            log.info("--- watch round %d (have %s) ---", rounds,
+                     {t: held.get(t, 0) for t in types})
+            sweep_once_per_type(client, args, azs, offered, held, made)
+            if _done(held):
+                break
+            time.sleep(args.interval)
+        log.info("WATCH: all per-type targets reached after %d round(s)", rounds)
+    else:
+        sweep_once_per_type(client, args, azs, offered, held, made)
+
+    log.info("=== DONE (per-type): %s (this run created %d reservation(s)) ===",
+             {t: held.get(t, 0) for t in types}, len(made))
+    for t in types:
+        got = held.get(t, 0)
+        flag = "FULL" if got >= args.per_type[t] else "short"
+        log.info("  %-14s %d/%d instances [%s]", t, got, args.per_type[t], flag)
+    for crid, t, a in made:
+        log.info("  %s %s @ %s", crid, t, a)
+    if not args.live:
+        log.info("(dry-run — nothing was actually reserved, no billing)")
+    else:
+        log.warning("LIVE reservations are billing NOW at On-Demand rate.")
+        log.warning("Run: python3 grab_odcr.py --cancel-all --live  to stop.")
+
+
 def run(args):
     client = ec2_client(args.region)
 
@@ -321,6 +527,15 @@ def run(args):
 
     if args.cancel_all:
         cancel_all(client, not args.live)
+        return
+
+    # PER-TYPE mode: independent instance-count target per type. Separate path
+    # from the core-target / per-AZ machinery below; those flags are ignored.
+    if getattr(args, "per_type", None):
+        if args.target_cores != 8 or args.per_az_cores is not None:
+            log.warning("--per-type is set: ignoring --target-cores / "
+                        "--per-az-cores (per-type has its own counts)")
+        _run_per_type(args, client)
         return
 
     log.info("region=%s dry_run=%s target_cores=%d end_hours=%s watch=%s",
@@ -453,6 +668,16 @@ def main():
                         "if not already in the built-in table, so you are not "
                         "limited to i4i/i4g. e.g. --types r7i.48xlarge m7i.24xlarge "
                         "(auto-sorted large-first; unknown-to-AWS names dropped)")
+    p.add_argument("--per-type", nargs="*", metavar="TYPE:COUNT",
+                   help="PER-TYPE mode: grab an INDEPENDENT number of instances "
+                        "per type, given as TYPE:COUNT tokens. Each target is "
+                        "judged on its own — a type with no capacity never blocks "
+                        "the others, there is NO shared core target and NO per-AZ "
+                        "balancing (grabs wherever the type has capacity). vCPU is "
+                        "looked up from AWS for any non-i4i type. Restart-safe: "
+                        "held counts are re-read from AWS each round. Overrides "
+                        "--target-cores / --per-az-cores. e.g. --per-type "
+                        "i4i.16xlarge:10 i4i.8xlarge:5 r7i.24xlarge:3")
     p.add_argument("--azs", nargs="*",
                    help="lock to these AZ names, e.g. --azs us-east-1c us-east-1d "
                         "(default: every AZ in the region)")
@@ -470,6 +695,15 @@ def main():
                    help="list current reservations + per-AZ/total core summary "
                         "(auto-reads target from grabs.jsonl), then exit")
     args = p.parse_args()
+    # Parse --per-type TYPE:COUNT tokens into an ordered {type: count} dict that
+    # run() consumes directly. Abort on any malformed token rather than silently
+    # grabbing the wrong thing.
+    per_type, pt_errors = parse_per_type(args.per_type)
+    if pt_errors:
+        for e in pt_errors:
+            log.error("--per-type %s", e)
+        sys.exit(2)
+    args.per_type = per_type
     try:
         run(args)
     except KeyboardInterrupt:

@@ -31,6 +31,7 @@ import grab_odcr
 from grab_odcr import (
     held_cores_by_az, _az_full, sweep_once, print_list,
     reserve_one, list_reservations, cancel_all, TAG_KEY, TAG_VAL,
+    parse_per_type, held_count_by_type, sweep_once_per_type,
 )
 from common import VCPU
 
@@ -571,6 +572,240 @@ class RunLearnsCustomType(unittest.TestCase):
         with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
             grab_odcr.run(args)
         self.assertEqual(client.created, [])
+
+
+class ParsePerType(unittest.TestCase):
+    def test_parses_type_count_pairs_in_order(self):
+        targets, errors = parse_per_type(
+            ["i4i.16xlarge:10", "i4i.8xlarge:5", "r7i.24xlarge:3"])
+        self.assertEqual(errors, [])
+        self.assertEqual(targets,
+                         {"i4i.16xlarge": 10, "i4i.8xlarge": 5, "r7i.24xlarge": 3})
+        self.assertEqual(list(targets), ["i4i.16xlarge", "i4i.8xlarge", "r7i.24xlarge"])
+
+    def test_none_and_empty_yield_empty(self):
+        self.assertEqual(parse_per_type(None), ({}, []))
+        self.assertEqual(parse_per_type([]), ({}, []))
+
+    def test_missing_colon_is_error(self):
+        targets, errors = parse_per_type(["i4i.16xlarge"])
+        self.assertEqual(targets, {})
+        self.assertEqual(len(errors), 1)
+
+    def test_non_integer_count_is_error(self):
+        targets, errors = parse_per_type(["i4i.16xlarge:lots"])
+        self.assertEqual(targets, {})
+        self.assertEqual(len(errors), 1)
+
+    def test_non_positive_count_is_error(self):
+        _t0, e0 = parse_per_type(["i4i.16xlarge:0"])
+        _t1, e1 = parse_per_type(["i4i.16xlarge:-3"])
+        self.assertEqual(len(e0), 1)
+        self.assertEqual(len(e1), 1)
+
+    def test_empty_type_is_error(self):
+        targets, errors = parse_per_type([":5"])
+        self.assertEqual(targets, {})
+        self.assertEqual(len(errors), 1)
+
+    def test_duplicate_type_last_write_wins(self):
+        targets, errors = parse_per_type(["i4i.16xlarge:2", "i4i.16xlarge:9"])
+        self.assertEqual(errors, [])
+        self.assertEqual(targets, {"i4i.16xlarge": 9})
+
+    def test_size_with_colon_only_splits_on_last(self):
+        # rpartition on the LAST colon, so a stray type is still parsed sanely
+        targets, errors = parse_per_type(["i4i.16xlarge:10"])
+        self.assertEqual(targets, {"i4i.16xlarge": 10})
+        self.assertEqual(errors, [])
+
+
+class HeldCountByType(unittest.TestCase):
+    def test_counts_instances_not_cores_or_objects(self):
+        # two reservations of the same type: 3 + 2 = 5 INSTANCES (not cores)
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 3),
+            _reservation("i4i.16xlarge", "us-east-1d", 2),
+            _reservation("i4i.8xlarge", "us-east-1b", 4),
+        ])
+        held = held_count_by_type(client, {"i4i.16xlarge": 99, "i4i.8xlarge": 99})
+        self.assertEqual(held, {"i4i.16xlarge": 5, "i4i.8xlarge": 4})
+
+    def test_ignores_types_not_requested(self):
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 3),
+            _reservation("i4i.8xlarge", "us-east-1b", 4),   # not in requested set
+        ])
+        self.assertEqual(held_count_by_type(client, {"i4i.16xlarge": 99}),
+                         {"i4i.16xlarge": 3})
+
+    def test_ignores_untagged_and_other_tags(self):
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 3, tag=None),
+            _reservation("i4i.16xlarge", "us-east-1b", 2, tag="other"),
+            _reservation("i4i.16xlarge", "us-east-1b", 1),   # ours
+        ])
+        self.assertEqual(held_count_by_type(client, {"i4i.16xlarge": 99}),
+                         {"i4i.16xlarge": 1})
+
+
+def _pt_args(per_type, **over):
+    base = dict(region="us-east-1", per_type=dict(per_type), live=True,
+                end_hours=None)
+    base.update(over)
+    return Namespace(**base)
+
+
+class SweepOncePerType(unittest.TestCase):
+    """Per-type sweep: each type reaches its OWN instance target; a dry type
+    never blocks another; no shared gate, no per-AZ cap."""
+
+    def setUp(self):
+        self._orig = grab_odcr.record_grab
+        grab_odcr.record_grab = lambda *a, **k: None
+
+    def tearDown(self):
+        grab_odcr.record_grab = self._orig
+
+    def test_each_type_hits_its_own_count(self):
+        args = _pt_args({"i4i.16xlarge": 3, "i4i.8xlarge": 2})
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {("i4i.16xlarge", "us-east-1b"), ("i4i.16xlarge", "us-east-1d"),
+                   ("i4i.8xlarge", "us-east-1b"), ("i4i.8xlarge", "us-east-1d")}
+        held = {}
+        client = FakeEC2()
+        sweep_once_per_type(client, args, azs, offered, held, [])
+        self.assertEqual(held, {"i4i.16xlarge": 3, "i4i.8xlarge": 2})
+        self.assertEqual(len([t for t, _a in client.created if t == "i4i.16xlarge"]), 3)
+        self.assertEqual(len([t for t, _a in client.created if t == "i4i.8xlarge"]), 2)
+
+    def test_dry_type_does_not_block_others(self):
+        # i4i.16xlarge has NO capacity anywhere; i4i.8xlarge still fills fully.
+        # Type-level dryness: FakeEC2.no_capacity is per-AZ, so use a subclass
+        # that fails only for the one type.
+        class TypeDryEC2(FakeEC2):
+            def create_capacity_reservation(self, **kw):
+                if kw["InstanceType"] == "i4i.16xlarge":
+                    raise _cap_error("InsufficientInstanceCapacity")
+                return super().create_capacity_reservation(**kw)
+
+        args = _pt_args({"i4i.16xlarge": 5, "i4i.8xlarge": 4})
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {("i4i.16xlarge", "us-east-1b"), ("i4i.16xlarge", "us-east-1d"),
+                   ("i4i.8xlarge", "us-east-1b"), ("i4i.8xlarge", "us-east-1d")}
+        held = {}
+        client = TypeDryEC2()
+        sweep_once_per_type(client, args, azs, offered, held, [])
+        self.assertEqual(held.get("i4i.16xlarge", 0), 0)   # dry, stayed empty
+        self.assertEqual(held.get("i4i.8xlarge"), 4)       # filled anyway
+
+    def test_capacity_exhausted_does_not_infinite_loop(self):
+        # target 5 but NO capacity at all -> must return, not spin forever.
+        args = _pt_args({"i4i.16xlarge": 5})
+        azs = ["us-east-1b"]
+        offered = {("i4i.16xlarge", "us-east-1b")}
+        held = {}
+        client = FakeEC2(no_capacity={"us-east-1b"})
+        sweep_once_per_type(client, args, azs, offered, held, [])
+        self.assertEqual(held.get("i4i.16xlarge", 0), 0)
+        self.assertEqual(client.created, [])
+
+    def test_offered_filter_skips_unavailable_type_az(self):
+        # 8xlarge only offered in 1d; 16xlarge only in 1b.
+        args = _pt_args({"i4i.16xlarge": 2, "i4i.8xlarge": 2})
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {("i4i.16xlarge", "us-east-1b"), ("i4i.8xlarge", "us-east-1d")}
+        held = {}
+        client = FakeEC2()
+        sweep_once_per_type(client, args, azs, offered, held, [])
+        self.assertEqual(held, {"i4i.16xlarge": 2, "i4i.8xlarge": 2})
+        # every 16xlarge grab landed in 1b, every 8xlarge in 1d
+        self.assertTrue(all(a == "us-east-1b"
+                            for t, a in client.created if t == "i4i.16xlarge"))
+        self.assertTrue(all(a == "us-east-1d"
+                            for t, a in client.created if t == "i4i.8xlarge"))
+
+    def test_resume_tops_up_only_the_shortfall(self):
+        # already hold 2 of a target-3 type -> exactly ONE new reservation.
+        args = _pt_args({"i4i.16xlarge": 3})
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {("i4i.16xlarge", "us-east-1b"), ("i4i.16xlarge", "us-east-1d")}
+        held = {"i4i.16xlarge": 2}
+        client = FakeEC2()
+        sweep_once_per_type(client, args, azs, offered, held, [])
+        self.assertEqual(held["i4i.16xlarge"], 3)
+        self.assertEqual(len(client.created), 1)
+
+
+class RunPerType(unittest.TestCase):
+    """End-to-end run() in per-type mode, including learning a non-i4i type."""
+
+    def setUp(self):
+        self._orig_vcpu = dict(VCPU)
+        self._orig_rec = grab_odcr.record_grab
+        grab_odcr.record_grab = lambda *a, **k: None
+
+    def tearDown(self):
+        grab_odcr.record_grab = self._orig_rec
+        VCPU.clear()
+        VCPU.update(self._orig_vcpu)
+
+    def _args(self, per_type, **over):
+        base = dict(region="us-east-1", per_type=dict(per_type), types=None,
+                    target_cores=8, per_az_cores=None, azs=None, live=True,
+                    watch=False, interval=0, end_hours=None, list=False,
+                    cancel_all=False)
+        base.update(over)
+        return Namespace(**base)
+
+    def test_run_per_type_reserves_each_type(self):
+        client = RunFake(azs=["us-east-1b", "us-east-1d"], vcpus={})
+        args = self._args({"i4i.16xlarge": 2, "i4i.8xlarge": 1})
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(len([t for t, _a in client.created if t == "i4i.16xlarge"]), 2)
+        self.assertEqual(len([t for t, _a in client.created if t == "i4i.8xlarge"]), 1)
+
+    def test_run_per_type_learns_custom_type_vcpu(self):
+        self.assertNotIn("r7i.24xlarge", VCPU)
+        client = RunFake(azs=["us-east-1b"], vcpus={"r7i.24xlarge": 96})
+        args = self._args({"r7i.24xlarge": 2})
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(VCPU["r7i.24xlarge"], 96)
+        self.assertEqual(len(client.created), 2)
+
+    def test_run_per_type_drops_unresolvable_type(self):
+        # AWS knows nothing -> type dropped, nothing reserved, no crash.
+        client = RunFake(azs=["us-east-1b"], vcpus={})
+        args = self._args({"totally.bogus": 3})
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(client.created, [])
+
+    def test_run_per_type_honors_azs_scope(self):
+        # Region has 3 AZs but --azs locks the sweep to two of them: no grab
+        # may land in the excluded AZ. Target is a per-type TOTAL, filled
+        # across only the in-scope AZs (matches the chosen semantics).
+        client = RunFake(azs=["us-east-1b", "us-east-1c", "us-east-1d"], vcpus={})
+        args = self._args({"i4i.16xlarge": 3}, azs=["us-east-1b", "us-east-1d"])
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        grabbed_azs = {a for _t, a in client.created}
+        self.assertNotIn("us-east-1c", grabbed_azs)          # excluded AZ untouched
+        self.assertTrue(grabbed_azs <= {"us-east-1b", "us-east-1d"})
+        self.assertEqual(len(client.created), 3)             # total target met
+
+    def test_run_per_type_warns_and_ignores_missing_az(self):
+        # An --azs entry not present in the region is ignored (warned), the
+        # valid one still works, nothing crashes.
+        client = RunFake(azs=["us-east-1b"], vcpus={})
+        args = self._args({"i4i.16xlarge": 2},
+                          azs=["us-east-1b", "us-west-2a"])   # 2nd doesn't exist
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual({a for _t, a in client.created}, {"us-east-1b"})
+        self.assertEqual(len(client.created), 2)
 
 
 if __name__ == "__main__":
