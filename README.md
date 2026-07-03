@@ -122,7 +122,7 @@ Wants=network-online.target
 Type=simple
 User=ec2-user
 WorkingDirectory=/home/ec2-user/ec2-i4i-capacity-grabber
-ExecStart=/usr/bin/python3 grab_odcr.py --azs us-east-1b us-east-1d --per-az-cores 5000 --live --watch --interval 30
+ExecStart=/usr/bin/python3 grab_odcr.py --per-type i4i.16xlarge:100 i4i.8xlarge:50 --azs us-east-1b us-east-1d --live --watch --interval 30
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
@@ -132,9 +132,10 @@ WantedBy=multi-user.target
 EOF
 ```
 
+> ⚠️ **`--per-type i4i.16xlarge:100 i4i.8xlarge:50` 是占位示例值**，按你实际要抢的机型和台数改（`TYPE:COUNT`，COUNT 是台数）。也可以换回按核数均衡的老写法 `--per-az-cores 5000`（每 AZ 5000 核、总目标自动 = `5000 × 2 AZ = 10000`）——两种模式二选一，不要同时写。
 > 改命令参数就编辑这个文件的 `ExecStart=` 行；改完 `sudo systemctl daemon-reload && sudo systemctl restart grab-odcr`。
 > `WorkingDirectory` / `User` 按你实际放脚本的路径和用户改。
-> 这里**没写 `--target-cores`** 是对的：`--per-az-cores 5000` 会让总目标自动 = `5000 × 2 AZ = 10000`。启动后 `journalctl -u grab-odcr` 第一屏会有一行 `balanced mode: ... -> target 10000 vCPU`，确认是 10000 就对了。
+> 启动后看 `journalctl -u grab-odcr` 第一屏：per-type 模式会打印 `PER-TYPE mode: targets={...} AZs=[...]`，核对目标是否正确。
 
 **2. 启动 + 开机自启**
 
