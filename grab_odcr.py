@@ -45,7 +45,6 @@ import argparse
 import sys
 import time
 import json
-import datetime
 
 from botocore.exceptions import ClientError
 
@@ -62,12 +61,9 @@ TAG_VAL = "primeday-i4i-grab"
 log = setup_logging("grab_odcr.log")
 
 
-def reserve_one(client, itype, az, dry_run, end_hours=None):
-    """Create a count=1 ODCR. open matching, no commitment.
-
-    end_hours: if set, EndDateType=limited (auto-expires) as a billing guard.
-               if None, EndDateType=unlimited (until you cancel).
-    """
+def reserve_one(client, itype, az, dry_run):
+    """Create a count=1 ODCR. open matching, no commitment, no end date
+    (holds until you --cancel-all)."""
     kwargs = dict(
         InstanceType=itype,
         InstancePlatform="Linux/UNIX",
@@ -86,14 +82,8 @@ def reserve_one(client, itype, az, dry_run, end_hours=None):
             "ResourceType": "capacity-reservation",
             "Tags": [{"Key": TAG_KEY, "Value": TAG_VAL}],
         }],
+        EndDateType="unlimited",
     )
-    if end_hours:
-        end = (datetime.datetime.now(datetime.timezone.utc)
-               + datetime.timedelta(hours=end_hours))
-        kwargs["EndDateType"] = "limited"
-        kwargs["EndDate"] = end
-    else:
-        kwargs["EndDateType"] = "unlimited"
     return client.create_capacity_reservation(**kwargs)
 
 
@@ -115,7 +105,7 @@ def growable_map(client):
     return m
 
 
-def secure_one(client, itype, az, dry_run, end_hours=None, growable=None):
+def secure_one(client, itype, az, dry_run, growable=None):
     """Secure ONE instance of (type, az): GROW our existing reservation by +1
     when we already hold one, CREATE a count=1 reservation only when we don't.
     Returns the reservation id that now holds the new slot.
@@ -130,9 +120,6 @@ def secure_one(client, itype, az, dry_run, end_hours=None, growable=None):
         the map stays accurate WITHIN a sweep between AWS re-reads — same
         contract as the `held` gates. ModifyCapacityReservation takes an
         ABSOLUTE count, so an accurate local count is what makes +1 mean +1.
-
-    Grow keeps the reservation's existing EndDate; end_hours only applies to
-    the create path (the object's expiry is set once, at birth).
 
     dry-run always takes the create path (raises DryRunOperation like before),
     never calls Modify — the dry-run plan and its classification are unchanged.
@@ -156,7 +143,7 @@ def secure_one(client, itype, az, dry_run, end_hours=None, growable=None):
             if code != "InvalidCapacityReservationId.NotFound":
                 raise
             growable.pop(key, None)
-    resp = reserve_one(client, itype, az, dry_run, end_hours)
+    resp = reserve_one(client, itype, az, dry_run)
     crid = resp["CapacityReservation"]["CapacityReservationId"]
     growable[key] = [crid, 1]
     return crid
@@ -372,7 +359,7 @@ def sweep_once_per_type(client, args, azs, offered, held, made):
                     continue
                 try:
                     crid = secure_one(client, itype, az, not args.live,
-                                      args.end_hours, growable)
+                                      growable)
                     _on_grab(args, crid, itype, az, held, made)
                     progressed = True
                     throttle_attempt = 0
@@ -418,9 +405,8 @@ def run(args):
                   "(or --list / --cancel-all)")
         return
 
-    log.info("region=%s dry_run=%s targets=%s end_hours=%s watch=%s",
-             args.region, not args.live, dict(args.per_type),
-             args.end_hours, args.watch)
+    log.info("region=%s dry_run=%s targets=%s watch=%s",
+             args.region, not args.live, dict(args.per_type), args.watch)
 
     # Validate every requested type against AWS (DescribeInstanceTypes) so a
     # typo is dropped up front instead of failing on every reserve call.
@@ -511,9 +497,6 @@ def main():
                         "(default: every AZ in the region). The per-type COUNT "
                         "is a TOTAL filled across these AZs, wherever there is "
                         "capacity — no per-AZ balancing.")
-    p.add_argument("--end-hours", type=float, default=None,
-                   help="auto-expire reservations after N hours (billing guard); "
-                        "applies to the reservation object at creation")
     p.add_argument("--watch", action="store_true",
                    help="loop forever, re-sweeping until every type hits its "
                         "target (24x7 hunt)")

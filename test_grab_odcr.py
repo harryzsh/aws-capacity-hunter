@@ -15,7 +15,6 @@ the pure-Python core that makes a crash/restart safe and the account tidy:
 
 Run:  python3 -m unittest test_grab_odcr -v
 """
-import datetime
 import logging
 import os
 import tempfile
@@ -136,8 +135,7 @@ def _reservation(itype, az, count, tag=TAG_VAL, state="active", available=None):
 
 
 def _pt_args(per_type, **over):
-    base = dict(region="us-east-1", per_type=dict(per_type), live=True,
-                end_hours=None)
+    base = dict(region="us-east-1", per_type=dict(per_type), live=True)
     base.update(over)
     return Namespace(**base)
 
@@ -258,7 +256,7 @@ class PrintListSummary(unittest.TestCase):
 class ReserveOne(unittest.TestCase):
     """The single CreateCapacityReservation call — pin the exact params that
     make an OPEN, Linux/UNIX, default-tenancy, count=1 reservation (the 4
-    attributes an ASG must match), plus dry-run and end-hours behavior."""
+    attributes an ASG must match), plus dry-run behavior."""
 
     def test_open_linux_default_count1_tagged(self):
         client = FakeEC2()
@@ -283,22 +281,12 @@ class ReserveOne(unittest.TestCase):
             reserve_one(client, "i4i.16xlarge", "us-east-1b", dry_run=True)
         self.assertTrue(client.create_kwargs[-1]["DryRun"])
 
-    def test_no_end_hours_is_unlimited(self):
+    def test_always_unlimited_no_end_date(self):
         client = FakeEC2()
         reserve_one(client, "i4i.16xlarge", "us-east-1b", dry_run=False)
         kw = client.create_kwargs[-1]
         self.assertEqual(kw["EndDateType"], "unlimited")
         self.assertNotIn("EndDate", kw)
-
-    def test_end_hours_sets_limited_with_future_enddate(self):
-        client = FakeEC2()
-        reserve_one(client, "i4i.16xlarge", "us-east-1b", dry_run=False,
-                    end_hours=6)
-        kw = client.create_kwargs[-1]
-        self.assertEqual(kw["EndDateType"], "limited")
-        self.assertIn("EndDate", kw)
-        self.assertGreater(kw["EndDate"],
-                           datetime.datetime.now(datetime.timezone.utc))
 
 
 class ListReservations(unittest.TestCase):
@@ -451,7 +439,7 @@ class SecureOne(unittest.TestCase):
         client = FakeEC2([_reservation("i4i.16xlarge", "us-east-1b", 3)])
         growable = {("i4i.16xlarge", "us-east-1b"): ["cr-existing", 3]}
         crid = secure_one(client, "i4i.16xlarge", "us-east-1b",
-                          dry_run=False, end_hours=None, growable=growable)
+                          dry_run=False, growable=growable)
         self.assertEqual(crid, "cr-existing")
         self.assertEqual(client.modified, [("cr-existing", 4)])  # absolute 3+1
         self.assertEqual(client.created, [])                     # no new object
@@ -462,7 +450,7 @@ class SecureOne(unittest.TestCase):
         client = FakeEC2()
         growable = {}
         crid = secure_one(client, "i4i.16xlarge", "us-east-1b",
-                          dry_run=False, end_hours=None, growable=growable)
+                          dry_run=False, growable=growable)
         self.assertEqual(client.created, [("i4i.16xlarge", "us-east-1b")])
         self.assertEqual(client.modified, [])
         # registered: the next grab in this same sweep will GROW this crid
@@ -472,7 +460,7 @@ class SecureOne(unittest.TestCase):
         client = FakeEC2()                      # crid not in fake's store
         growable = {("i4i.16xlarge", "us-east-1b"): ["cr-gone", 2]}
         crid = secure_one(client, "i4i.16xlarge", "us-east-1b",
-                          dry_run=False, end_hours=None, growable=growable)
+                          dry_run=False, growable=growable)
         self.assertEqual(len(client.created), 1)          # fell back to create
         self.assertNotEqual(crid, "cr-gone")
         # stale entry replaced by the fresh reservation
@@ -484,7 +472,7 @@ class SecureOne(unittest.TestCase):
         growable = {("i4i.16xlarge", "us-east-1b"): ["cr-existing", 2]}
         with self.assertRaises(ClientError) as ctx:
             secure_one(client, "i4i.16xlarge", "us-east-1b",
-                       dry_run=False, end_hours=None, growable=growable)
+                       dry_run=False, growable=growable)
         from common import classify
         self.assertEqual(classify(ctx.exception), "capacity")
         # count NOT bumped — the grow failed
@@ -495,7 +483,7 @@ class SecureOne(unittest.TestCase):
         growable = {("i4i.16xlarge", "us-east-1b"): ["cr-existing", 3]}
         with self.assertRaises(ClientError):    # DryRunOperation, as before
             secure_one(client, "i4i.16xlarge", "us-east-1b",
-                       dry_run=True, end_hours=None, growable=growable)
+                       dry_run=True, growable=growable)
         self.assertEqual(client.modified, [])   # dry-run never modifies
         self.assertEqual(growable[("i4i.16xlarge", "us-east-1b")][1], 3)
 
@@ -677,7 +665,7 @@ class RunPerType(unittest.TestCase):
 
     def _args(self, per_type, **over):
         base = dict(region="us-east-1", per_type=dict(per_type), azs=None,
-                    live=True, watch=False, interval=0, end_hours=None,
+                    live=True, watch=False, interval=0,
                     list=False, cancel_all=False)
         base.update(over)
         return Namespace(**base)
