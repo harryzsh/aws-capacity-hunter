@@ -3,7 +3,7 @@
   "diagram_type": "workflow",
   "meta": {
     "title": "ODCR Capacity Grabber",
-    "subtitle": "watch 死等 · AZ×机型扫描 · grow-or-create 合并预留",
+    "subtitle": "watch 死等 · 按机型台数抢 · grow-or-create 合并预留",
     "output": "flow.html"
   },
   "lanes": [
@@ -24,9 +24,9 @@
   "mainPath": ["round", "reread", "gates", "decide", "grow", "ledger"],
   "nodes": [
     { "id": "round", "lane": "watch", "col": 0, "type": "frontend", "label": "开始一轮", "sublabel": "每 interval 秒" },
-    { "id": "reread", "lane": "watch", "col": 1, "type": "backend", "label": "重读持有", "sublabel": "AWS 实时核数" },
+    { "id": "reread", "lane": "watch", "col": 1, "type": "backend", "label": "重读持有", "sublabel": "AWS 实时台数" },
     { "id": "full", "lane": "watch", "col": 5, "type": "backend", "label": "抢满停止", "sublabel": "预留仍在计费" },
-    { "id": "gates", "lane": "sweep", "col": 2, "type": "security", "label": "闸门检查", "sublabel": "总量 / 每AZ上限" },
+    { "id": "gates", "lane": "sweep", "col": 2, "type": "security", "label": "闸门检查", "sublabel": "各机型台数目标" },
     { "id": "decide", "lane": "sweep", "col": 3, "type": "backend", "label": "secure_one", "sublabel": "查 (机型,AZ)", "tag": "grow 优先" },
     { "id": "grow", "lane": "aws", "col": 4, "type": "cloud", "label": "Modify +1", "sublabel": "已有对象加量" },
     { "id": "create", "lane": "aws", "col": 5, "type": "cloud", "label": "Create", "sublabel": "count=1 新对象" },
@@ -62,8 +62,8 @@
       "dot": "emerald",
       "title": "幂等 / 重启安全",
       "items": [
-        "每轮从 AWS 重读真实持有核数",
-        "闸门只按差额补抢，不超抢不抢歪",
+        "每轮从 AWS 重读各机型真实持有台数",
+        "闸门只按差额补抢，不超抢",
         "崩溃重启后找到旧对象继续 +1",
         "systemd Restart=always 安全"
       ]

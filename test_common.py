@@ -17,8 +17,8 @@ from botocore.exceptions import ClientError
 
 import common
 from common import (
-    VCPU, DEFAULT_PRIORITY, DEFAULT_REGION,
-    resolve_types, resolve_azs, list_azs, offered_types_by_az,
+    VCPU, DEFAULT_REGION,
+    resolve_azs, list_azs, offered_types_by_az,
     classify, backoff_sleep, record_grab, setup_logging, ec2_client,
     describe_vcpus, ensure_vcpu,
 )
@@ -26,44 +26,6 @@ from common import (
 
 def _err(code):
     return ClientError({"Error": {"Code": code, "Message": "x"}}, "Op")
-
-
-class ResolveTypes(unittest.TestCase):
-    def test_none_returns_default(self):
-        self.assertEqual(resolve_types(None), (list(DEFAULT_PRIORITY), []))
-
-    def test_empty_returns_default(self):
-        self.assertEqual(resolve_types([]), (list(DEFAULT_PRIORITY), []))
-
-    def test_sorts_large_first_by_vcpu(self):
-        ordered, dropped = resolve_types(
-            ["i4i.large", "i4i.16xlarge", "i4i.4xlarge"])
-        self.assertEqual(ordered,
-                         ["i4i.16xlarge", "i4i.4xlarge", "i4i.large"])
-        self.assertEqual(dropped, [])
-
-    def test_drops_unknown_types(self):
-        ordered, dropped = resolve_types(["i4i.16xlarge", "bogus.type"])
-        self.assertEqual(ordered, ["i4i.16xlarge"])
-        self.assertEqual(dropped, ["bogus.type"])
-
-    def test_all_unknown_yields_empty_ordered(self):
-        ordered, dropped = resolve_types(["nope1", "nope2"])
-        self.assertEqual(ordered, [])
-        self.assertEqual(sorted(dropped), ["nope1", "nope2"])
-
-    def test_i4g_fallback_known(self):
-        # both are 64 vCPU -> a tie; sorted() is stable so it keeps input
-        # order. Don't pin the tie order; just assert both survive, none drop.
-        ordered, dropped = resolve_types(["i4g.16xlarge", "i4i.16xlarge"])
-        self.assertEqual(dropped, [])
-        self.assertEqual(set(ordered), {"i4g.16xlarge", "i4i.16xlarge"})
-
-    def test_mixed_sizes_strictly_descending(self):
-        ordered, _ = resolve_types(
-            ["i4i.large", "i4i.32xlarge", "i4i.8xlarge", "i4i.2xlarge"])
-        self.assertEqual(ordered,
-                         ["i4i.32xlarge", "i4i.8xlarge", "i4i.2xlarge", "i4i.large"])
 
 
 class ResolveAzs(unittest.TestCase):
@@ -187,14 +149,13 @@ class RecordGrab(unittest.TestCase):
         self._p2.stop()
 
     def test_dry_run_writes_nothing(self):
-        record_grab("odcr", "i4i.16xlarge", "us-east-1b", 64, 64, 10000,
-                    "us-east-1", dry_run=True)
+        record_grab("odcr", "i4i.16xlarge", "us-east-1b", "us-east-1",
+                    dry_run=True, held_count=1, target_count=10)
         self.assertFalse(os.path.exists(self.ledger))
 
     def test_live_appends_one_json_line_with_fields(self):
-        record_grab("odcr", "i4i.16xlarge", "us-east-1b", 64, 128, 10000,
-                    "us-east-1", dry_run=False,
-                    per_az_cores=5000, per_az_total=64)
+        record_grab("odcr", "i4i.16xlarge", "us-east-1b", "us-east-1",
+                    dry_run=False, held_count=2, target_count=10)
         with open(self.ledger) as f:
             lines = f.read().splitlines()
         self.assertEqual(len(lines), 1)
@@ -202,27 +163,15 @@ class RecordGrab(unittest.TestCase):
         self.assertEqual(rec["via"], "odcr")
         self.assertEqual(rec["instance_type"], "i4i.16xlarge")
         self.assertEqual(rec["az"], "us-east-1b")
-        self.assertEqual(rec["vcpu"], 64)
-        self.assertEqual(rec["total_vcpu"], 128)
-        self.assertEqual(rec["target_vcpu"], 10000)
         self.assertEqual(rec["region"], "us-east-1")
-        self.assertEqual(rec["per_az_cores"], 5000)   # balanced-mode cap recorded
-        self.assertEqual(rec["per_az_total"], 64)     # cores held in this AZ
+        self.assertEqual(rec["held_count"], 2)     # instances held after grab
+        self.assertEqual(rec["target_count"], 10)  # --per-type target
         self.assertIn("ts", rec)
-
-    def test_per_az_fields_null_when_not_balanced(self):
-        # no per-az args -> fields present but null (not missing)
-        record_grab("odcr", "i4i.16xlarge", "us-east-1b", 64, 64, 1000,
-                    "us-east-1", dry_run=False)
-        with open(self.ledger) as f:
-            rec = json.loads(f.read().splitlines()[0])
-        self.assertIsNone(rec["per_az_cores"])
-        self.assertIsNone(rec["per_az_total"])
 
     def test_appends_not_overwrites(self):
         for i in range(3):
-            record_grab("odcr", "i4i.16xlarge", "us-east-1b", 64, 64 * (i + 1),
-                        10000, "us-east-1", dry_run=False)
+            record_grab("odcr", "i4i.16xlarge", "us-east-1b", "us-east-1",
+                        dry_run=False, held_count=i + 1, target_count=10)
         with open(self.ledger) as f:
             self.assertEqual(len(f.read().splitlines()), 3)
 

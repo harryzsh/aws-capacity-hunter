@@ -1,4 +1,4 @@
-"""Shared helpers for the i4i capacity-grab script.
+"""Shared helpers for the ODCR capacity-grab script.
 
 grab_odcr.py imports from here.
 Region is configurable via --region (default: us-east-1).
@@ -21,7 +21,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 GRAB_LEDGER = os.path.join(LOGS_DIR, "grabs.jsonl")
 
-# vCPU per i4i size — used to count progress toward the core target.
+# Known instance types (vCPU per size). Used as an "AWS knows this type"
+# pre-validated set so the default i4i/i4g path never calls
+# DescribeInstanceTypes; other types are validated via ensure_vcpu().
 VCPU = {
     "i4i.large": 2,
     "i4i.xlarge": 4,
@@ -40,11 +42,6 @@ VCPU = {
     "i4g.8xlarge": 32,
     "i4g.16xlarge": 64,
 }
-
-# DEFAULT: only i4i.16xlarge. The requirement is "must be 16xl by default".
-# To allow fallback to other sizes, pass --types explicitly; whatever you pass
-# is auto-sorted LARGE-first (see resolve_types) so big blocks go first.
-DEFAULT_PRIORITY = ["i4i.16xlarge"]
 
 # Errors that just mean "no capacity here, move on" — NOT a script failure.
 CAPACITY_ERRORS = {
@@ -67,6 +64,8 @@ def setup_logging(logfile=None):
     """
     logger = logging.getLogger("i4i-grab")
     logger.setLevel(logging.INFO)
+    for h in logger.handlers:
+        h.close()
     logger.handlers.clear()
     fmt = logging.Formatter(
         "%(asctime)s %(levelname)-5s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
@@ -87,16 +86,16 @@ def setup_logging(logfile=None):
     return logger
 
 
-def record_grab(via, itype, az, vcpu, total, target, region, dry_run,
-                per_az_cores=None, per_az_total=None):
-    """Append one JSON line to the ledger every time we secure capacity.
+def record_grab(via, itype, az, region, dry_run,
+                held_count=None, target_count=None):
+    """Append one JSON line to the ledger every time we secure ONE instance.
 
     Machine-readable feed for downstream tooling (parsers, dashboards, etc.).
     Skipped during dry-run so the ledger only ever holds real grabs.
 
-    per_az_cores:  the --per-az-cores cap in effect (None if not balanced mode).
-    per_az_total:  cores held in THIS az after this grab (so the ledger shows
-                   how the balanced run progresses per AZ, not just the total).
+    held_count:   instances of this type held after this grab.
+    target_count: this type's --per-type target (lets --list show progress
+                  without re-typing the targets).
     """
     if dry_run:
         return
@@ -107,11 +106,8 @@ def record_grab(via, itype, az, vcpu, total, target, region, dry_run,
         "instance_type": itype,
         "az": az,
         "region": region,
-        "vcpu": vcpu,
-        "total_vcpu": total,
-        "target_vcpu": target,
-        "per_az_cores": per_az_cores,    # cap per AZ (null = not balanced mode)
-        "per_az_total": per_az_total,    # cores held in this AZ after this grab
+        "held_count": held_count,
+        "target_count": target_count,
     }
     with open(GRAB_LEDGER, "a") as f:
         f.write(json.dumps(rec) + "\n")
@@ -152,12 +148,12 @@ def describe_vcpus(client, types):
 
 
 def ensure_vcpu(client, types):
-    """Make sure every type in `types` has a vCPU count in the VCPU table.
+    """Validate every type in `types` against AWS, learning unknown ones.
 
-    For any requested type NOT already known, look it up from AWS (one
-    DescribeInstanceTypes call) and insert it into the in-memory VCPU table so
-    all the downstream core-counting logic (resolve_types, held_cores_by_az,
-    sweep_once) works on it unchanged.
+    For any requested type NOT already in the VCPU table, look it up from AWS
+    (one DescribeInstanceTypes call) and insert it — this doubles as the
+    "does AWS know this instance type at all?" validation for --per-type, so
+    a typo is dropped up front instead of failing on every reserve call.
 
     Returns (added, unresolvable):
       added        -> {type: vcpu} newly learned and inserted this call
@@ -179,24 +175,6 @@ def ensure_vcpu(client, types):
     added = dict(learned)
     unresolvable = [t for t in unknown if t not in learned]
     return added, unresolvable
-
-
-def resolve_types(types):
-    """Normalize the instance-type priority list.
-
-    - None / empty  -> DEFAULT_PRIORITY (just i4i.16xlarge).
-    - Otherwise     -> the given list, auto-sorted LARGE-first by vCPU so the
-                       caller never has to worry about ordering. Unknown types
-                       (not in VCPU) are dropped with the list of drops returned
-                       so the caller can warn.
-    Returns (ordered_types, dropped_unknown).
-    """
-    if not types:
-        return list(DEFAULT_PRIORITY), []
-    known = [t for t in types if t in VCPU]
-    dropped = [t for t in types if t not in VCPU]
-    ordered = sorted(known, key=lambda t: VCPU[t], reverse=True)
-    return ordered, dropped
 
 
 def resolve_azs(all_azs, requested):
