@@ -665,7 +665,7 @@ class RunPerType(unittest.TestCase):
 
     def _args(self, per_type, **over):
         base = dict(region="us-east-1", per_type=dict(per_type), azs=None,
-                    live=True, watch=False, interval=0,
+                    live=True, watch=False, interval=0, add=False,
                     list=False, cancel_all=False)
         base.update(over)
         return Namespace(**base)
@@ -728,6 +728,60 @@ class RunPerType(unittest.TestCase):
             grab_odcr.run(args)
         self.assertEqual({a for _t, a in client.created}, {"us-east-1b"})
         self.assertEqual(_added(client), 2)
+
+    def test_absolute_target_already_met_grabs_nothing(self):
+        # default (absolute) semantics: hold 24, target 1 -> nothing to do.
+        client = RunFake(
+            azs=["us-east-1a"],
+            reservations=[_reservation("i4i.16xlarge", "us-east-1a", 24)])
+        args = self._args({"i4i.16xlarge": 1}, azs=["us-east-1a"])
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(_added(client), 0)
+
+    def test_add_grabs_n_more_on_top_of_held(self):
+        # --add: hold 24, ask +1 -> effective target 25, exactly ONE grab
+        # (a grow of the existing reservation, no new object).
+        client = RunFake(
+            azs=["us-east-1a"],
+            reservations=[_reservation("i4i.16xlarge", "us-east-1a", 24)])
+        args = self._args({"i4i.16xlarge": 1}, azs=["us-east-1a"], add=True)
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(_added(client), 1)
+        self.assertEqual(client.created, [])              # grew, not created
+        self.assertEqual(client._reservations[0]["TotalInstanceCount"], 25)
+
+    def test_add_from_zero_equals_absolute(self):
+        # --add with nothing held: +2 == grab 2, same as absolute.
+        client = RunFake(azs=["us-east-1b"], vcpus={})
+        args = self._args({"i4i.16xlarge": 2}, add=True)
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(_added(client), 2)
+
+    def test_add_requires_live(self):
+        # --add is a manual top-up action; a dry-run "+N" has no stable base
+        # to add onto, so it is rejected up front (no API writes).
+        client = RunFake(azs=["us-east-1b"])
+        args = self._args({"i4i.16xlarge": 1}, add=True, live=False)
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(client.created, [])
+        self.assertEqual(client.modified, [])
+
+    def test_add_rejects_watch(self):
+        # --add + --watch is the systemd footgun (every restart adds N more);
+        # refuse the combination outright, no API writes.
+        client = RunFake(
+            azs=["us-east-1a"],
+            reservations=[_reservation("i4i.16xlarge", "us-east-1a", 24)])
+        args = self._args({"i4i.16xlarge": 1}, azs=["us-east-1a"],
+                          add=True, watch=True)
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(_added(client), 0)
+        self.assertEqual(client.modified, [])
 
 
 if __name__ == "__main__":

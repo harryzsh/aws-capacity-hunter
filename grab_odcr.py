@@ -405,8 +405,29 @@ def run(args):
                   "(or --list / --cancel-all)")
         return
 
-    log.info("region=%s dry_run=%s targets=%s watch=%s",
-             args.region, not args.live, dict(args.per_type), args.watch)
+    # --add is a one-shot manual top-up ("N MORE on top of what I hold").
+    # It must never loop or restart-resume: under --watch (and thus under
+    # systemd Restart=always) every re-entry would re-add N on top of the new
+    # total — unbounded growth. And a dry-run "+N" has no stable base to add
+    # onto. Refuse both combinations outright.
+    if getattr(args, "add", False):
+        if args.watch:
+            log.error("--add cannot be combined with --watch: every restart "
+                      "would add N more on top of the new total (unbounded "
+                      "growth under systemd Restart=always). Run --add as a "
+                      "one-shot, or set an absolute --per-type target for "
+                      "the watcher.")
+            return
+        if not args.live:
+            log.error("--add requires --live: '+N more' needs the real held "
+                      "count from AWS as its base. Preview the plan with an "
+                      "absolute --per-type target instead.")
+            return
+
+    log.info("region=%s dry_run=%s targets=%s%s watch=%s",
+             args.region, not args.live, dict(args.per_type),
+             " (ADD: +N on top of held)" if getattr(args, "add", False) else "",
+             args.watch)
 
     # Validate every requested type against AWS (DescribeInstanceTypes) so a
     # typo is dropped up front instead of failing on every reserve call.
@@ -445,6 +466,14 @@ def run(args):
     held = held_count_by_type(client, args.per_type) if args.live else {}
     if args.live and held:
         log.info("resumed from AWS: already hold %s", held)
+
+    # --add: convert "+N more" into an absolute target of held + N, computed
+    # ONCE from the AWS truth read above. From here on the normal absolute
+    # machinery (gates, sweeps, resume within this process) works unchanged.
+    if getattr(args, "add", False):
+        args.per_type = {t: held.get(t, 0) + n for t, n in args.per_type.items()}
+        log.info("ADD mode: effective targets = held + N -> %s",
+                 dict(args.per_type))
 
     if args.watch:
         log.info("WATCH mode: re-sweeping every %ds until every type hits its "
@@ -497,6 +526,13 @@ def main():
                         "(default: every AZ in the region). The per-type COUNT "
                         "is a TOTAL filled across these AZs, wherever there is "
                         "capacity — no per-AZ balancing.")
+    p.add_argument("--add", action="store_true",
+                   help="one-shot manual top-up: each --per-type COUNT means "
+                        "'N MORE on top of what I already hold' instead of an "
+                        "absolute total. Requires --live; refuses --watch "
+                        "(a restarting watcher would re-add N forever). "
+                        "e.g. holding 24, '--per-type i7i.8xlarge:1 --add "
+                        "--live' grabs exactly 1 more -> 25.")
     p.add_argument("--watch", action="store_true",
                    help="loop forever, re-sweeping until every type hits its "
                         "target (24x7 hunt)")
