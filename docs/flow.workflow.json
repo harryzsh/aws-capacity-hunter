@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "ODCR Capacity Grabber",
+    "subtitle": "watch 死等 · AZ×机型扫描 · grow-or-create 合并预留",
+    "output": "flow.html"
+  },
+  "lanes": [
+    { "id": "watch", "label": "Watch 循环（--watch）" },
+    { "id": "sweep", "label": "Sweep（AZ × 机型）" },
+    { "id": "aws", "label": "AWS EC2 API" },
+    { "id": "exceptions", "label": "异常处理", "variant": "exception" },
+    { "id": "book", "label": "台账 / 监控" }
+  ],
+  "phases": [
+    { "id": "round", "label": "每轮开始", "fromCol": 0, "toCol": 1 },
+    { "id": "scan", "label": "扫描 + 闸门", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "grab", "label": "抢占 + 记账", "fromCol": 4, "toCol": 5, "variant": "dashed" }
+  ],
+  "groups": [
+    { "id": "secure", "label": "全有或全无", "lane": "aws", "fromCol": 4, "toCol": 5, "variant": "emphasis" }
+  ],
+  "mainPath": ["round", "reread", "gates", "decide", "grow", "ledger"],
+  "nodes": [
+    { "id": "round", "lane": "watch", "col": 0, "type": "frontend", "label": "开始一轮", "sublabel": "每 interval 秒" },
+    { "id": "reread", "lane": "watch", "col": 1, "type": "backend", "label": "重读持有", "sublabel": "AWS 实时核数" },
+    { "id": "full", "lane": "watch", "col": 5, "type": "backend", "label": "抢满停止", "sublabel": "预留仍在计费" },
+    { "id": "gates", "lane": "sweep", "col": 2, "type": "security", "label": "闸门检查", "sublabel": "总量 / 每AZ上限" },
+    { "id": "decide", "lane": "sweep", "col": 3, "type": "backend", "label": "secure_one", "sublabel": "查 (机型,AZ)", "tag": "grow 优先" },
+    { "id": "grow", "lane": "aws", "col": 4, "type": "cloud", "label": "Modify +1", "sublabel": "已有对象加量" },
+    { "id": "create", "lane": "aws", "col": 5, "type": "cloud", "label": "Create", "sublabel": "count=1 新对象" },
+    { "id": "nocap", "lane": "exceptions", "col": 2, "type": "messagebus", "label": "没货", "sublabel": "跳下个组合" },
+    { "id": "throttle", "lane": "exceptions", "col": 3, "type": "messagebus", "label": "限流", "sublabel": "退避后重试" },
+    { "id": "ledger", "lane": "book", "col": 5, "type": "database", "label": "记账", "sublabel": "held + grabs.jsonl" }
+  ],
+  "edges": [
+    { "from": "round", "to": "reread", "variant": "default" },
+    { "from": "reread", "to": "full", "label": "达标", "variant": "default" },
+    { "from": "reread", "to": "gates", "label": "未达标", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "drop" },
+    { "from": "gates", "to": "decide", "variant": "emphasis" },
+    { "from": "decide", "to": "grow", "label": "已有", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "drop", "labelDy": 11 },
+    { "from": "decide", "to": "create", "label": "没有", "variant": "default", "fromSide": "right", "toSide": "top", "route": "drop", "labelSegment": 0, "labelDx": 60, "labelDy": 34 },
+    { "from": "grow", "to": "create", "label": "NotFound", "variant": "dashed", "role": "branch", "labelAt": [563, 337] },
+    { "from": "grow", "to": "nocap", "label": "没货", "variant": "security", "role": "error", "fromSide": "bottom", "toSide": "top", "route": "drop", "labelSegment": 1 },
+    { "from": "create", "to": "throttle", "label": "限流", "variant": "security", "role": "error", "fromSide": "bottom", "toSide": "top", "route": "drop", "labelSegment": 1 },
+    { "from": "grow", "to": "ledger", "label": "成功", "variant": "emphasis", "fromSide": "right", "toSide": "top", "route": "drop" },
+    { "from": "ledger", "to": "round", "label": "下一轮", "variant": "dashed", "role": "return", "fromSide": "left", "toSide": "left", "route": "return-left", "labelDx": 24 }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "合并语义（grow-or-create）",
+      "items": [
+        "每个 机型×AZ 只保留一个预留对象",
+        "首台 Create count=1，之后 Modify +1",
+        "Modify 与 Create 容量语义相同：全有或全无",
+        "抢满 156 台 = 2 个对象，不是 156 个"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "幂等 / 重启安全",
+      "items": [
+        "每轮从 AWS 重读真实持有核数",
+        "闸门只按差额补抢，不超抢不抢歪",
+        "崩溃重启后找到旧对象继续 +1",
+        "systemd Restart=always 安全"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "异常语义",
+      "items": [
+        "没货 → 跳过，下个 AZ/机型组合",
+        "限流 → 指数退避后重试同目标",
+        "NotFound（对象被取消）→ 回退新建",
+        "其他错误 → fatal，立即退出"
+      ]
+    }
+  ]
+}

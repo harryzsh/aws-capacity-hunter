@@ -49,15 +49,18 @@ def _cap_error(code):
 class FakeEC2:
     """Minimal stand-in for a boto3 EC2 client.
 
-    create_capacity_reservation records (type, az) and returns a fake id,
-    UNLESS that AZ is in `no_capacity` (raises InsufficientInstanceCapacity).
-    DryRun=True always raises DryRunOperation (mirrors real EC2).
+    STATEFUL like real EC2: create appends to the reservations that
+    describe_capacity_reservations returns, and modify updates the count in
+    place — so growable_map() sees what a sweep created, exactly as on AWS.
+    Capacity errors: an AZ in `no_capacity` fails BOTH create and modify with
+    InsufficientInstanceCapacity. DryRun=True always raises DryRunOperation.
     """
     def __init__(self, reservations=None, no_capacity=()):
         self._reservations = reservations or []
         self._no_capacity = set(no_capacity)
         self.created = []          # list of (itype, az)
         self.create_kwargs = []    # full kwargs of each create call
+        self.modified = []         # list of (crid, new_count) — one per grow
         self.cancelled = []        # crids passed to cancel
         self._n = 0
 
@@ -72,12 +75,52 @@ class FakeEC2:
         if az in self._no_capacity:
             raise _cap_error("InsufficientInstanceCapacity")
         self._n += 1
+        crid = "cr-%04d" % self._n
         self.created.append((kwargs["InstanceType"], az))
-        return {"CapacityReservation": {"CapacityReservationId": "cr-%04d" % self._n}}
+        tags = []
+        for spec in kwargs.get("TagSpecifications", []):
+            tags.extend(spec.get("Tags", []))
+        count = kwargs.get("InstanceCount", 1)
+        self._reservations.append({
+            "CapacityReservationId": crid,
+            "InstanceType": kwargs["InstanceType"],
+            "AvailabilityZone": az,
+            "State": "active",
+            "TotalInstanceCount": count,
+            "AvailableInstanceCount": count,
+            "Tags": tags,
+        })
+        return {"CapacityReservation": {"CapacityReservationId": crid}}
+
+    def modify_capacity_reservation(self, CapacityReservationId=None,
+                                    InstanceCount=None, DryRun=False):
+        if DryRun:
+            raise _cap_error("DryRunOperation")
+        for r in self._reservations:
+            if r["CapacityReservationId"] == CapacityReservationId:
+                if r["AvailabilityZone"] in self._no_capacity:
+                    raise _cap_error("InsufficientInstanceCapacity")
+                r["TotalInstanceCount"] = InstanceCount
+                self.modified.append((CapacityReservationId, InstanceCount))
+                return {"Return": True}
+        raise _cap_error("InvalidCapacityReservationId.NotFound")
 
     def cancel_capacity_reservation(self, CapacityReservationId=None):
         self.cancelled.append(CapacityReservationId)
         return {}
+
+
+def _added(client, itype=None, az=None):
+    """Instances secured = creates + grows (each modify call is a +1 grow),
+    optionally filtered by instance type and/or AZ."""
+    def keep(t, a):
+        return (itype is None or t == itype) and (az is None or a == az)
+    creates = [1 for t, a in client.created if keep(t, a)]
+    by_id = {r["CapacityReservationId"]: (r["InstanceType"], r["AvailabilityZone"])
+             for r in client._reservations}
+    grows = [1 for c, _n in client.modified
+             if c in by_id and keep(*by_id[c])]
+    return len(creates) + len(grows)
 
 
 def _reservation(itype, az, count, tag=TAG_VAL, state="active", available=None):
@@ -314,11 +357,10 @@ class ResumeBehavior(unittest.TestCase):
 
         _drain(client, args, azs, offered, held)
 
-        # 1b was already at cap -> ZERO new reservations there.
-        self.assertEqual([az for _t, az in client.created if az == "us-east-1b"], [])
-        # 1d topped from 128 to 320 -> exactly 3 new (3*64=192).
-        self.assertEqual(
-            len([az for _t, az in client.created if az == "us-east-1d"]), 3)
+        # 1b was already at cap -> ZERO new grabs there (no create, no grow).
+        self.assertEqual(_added(client, az="us-east-1b"), 0)
+        # 1d topped from 128 to 320 -> exactly 3 grabs (3*64=192).
+        self.assertEqual(_added(client, az="us-east-1d"), 3)
         self.assertEqual(held, {"us-east-1b": cap, "us-east-1d": cap})
 
     def test_fresh_start_fills_both_azs_evenly(self):
@@ -330,7 +372,9 @@ class ResumeBehavior(unittest.TestCase):
         client = FakeEC2()
         _drain(client, args, azs, offered, held)
         self.assertEqual(held, {"us-east-1b": cap, "us-east-1d": cap})
-        self.assertEqual(len(client.created), 6)        # 3 per AZ
+        # 3 grabs per AZ (1 create + 2 grows each) — capacity unchanged
+        self.assertEqual(_added(client, az="us-east-1b"), 3)
+        self.assertEqual(_added(client, az="us-east-1d"), 3)
 
     def test_already_at_target_does_nothing(self):
         cap = 5 * V16
@@ -377,7 +421,7 @@ class ResumeBehavior(unittest.TestCase):
         _drain(client, args, azs, offered, held)
         # 64,128,192 (<200, grab) -> 256 (>=200, stop). ends at 256, 4 grabs.
         self.assertEqual(held["us-east-1b"], 256)
-        self.assertEqual(len(client.created), 4)
+        self.assertEqual(_added(client), 4)
         self.assertLess(held["us-east-1b"] - 200, V16)  # overshoot < 1 instance
 
 
@@ -676,8 +720,8 @@ class SweepOncePerType(unittest.TestCase):
         client = FakeEC2()
         sweep_once_per_type(client, args, azs, offered, held, [])
         self.assertEqual(held, {"i4i.16xlarge": 3, "i4i.8xlarge": 2})
-        self.assertEqual(len([t for t, _a in client.created if t == "i4i.16xlarge"]), 3)
-        self.assertEqual(len([t for t, _a in client.created if t == "i4i.8xlarge"]), 2)
+        self.assertEqual(_added(client, itype="i4i.16xlarge"), 3)
+        self.assertEqual(_added(client, itype="i4i.8xlarge"), 2)
 
     def test_dry_type_does_not_block_others(self):
         # i4i.16xlarge has NO capacity anywhere; i4i.8xlarge still fills fully.
@@ -763,8 +807,8 @@ class RunPerType(unittest.TestCase):
         args = self._args({"i4i.16xlarge": 2, "i4i.8xlarge": 1})
         with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
             grab_odcr.run(args)
-        self.assertEqual(len([t for t, _a in client.created if t == "i4i.16xlarge"]), 2)
-        self.assertEqual(len([t for t, _a in client.created if t == "i4i.8xlarge"]), 1)
+        self.assertEqual(_added(client, itype="i4i.16xlarge"), 2)
+        self.assertEqual(_added(client, itype="i4i.8xlarge"), 1)
 
     def test_run_per_type_learns_custom_type_vcpu(self):
         self.assertNotIn("r7i.24xlarge", VCPU)
@@ -773,7 +817,7 @@ class RunPerType(unittest.TestCase):
         with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
             grab_odcr.run(args)
         self.assertEqual(VCPU["r7i.24xlarge"], 96)
-        self.assertEqual(len(client.created), 2)
+        self.assertEqual(_added(client), 2)
 
     def test_run_per_type_drops_unresolvable_type(self):
         # AWS knows nothing -> type dropped, nothing reserved, no crash.
@@ -791,10 +835,10 @@ class RunPerType(unittest.TestCase):
         args = self._args({"i4i.16xlarge": 3}, azs=["us-east-1b", "us-east-1d"])
         with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
             grab_odcr.run(args)
+        self.assertEqual(_added(client, az="us-east-1c"), 0)  # excluded AZ untouched
         grabbed_azs = {a for _t, a in client.created}
-        self.assertNotIn("us-east-1c", grabbed_azs)          # excluded AZ untouched
         self.assertTrue(grabbed_azs <= {"us-east-1b", "us-east-1d"})
-        self.assertEqual(len(client.created), 3)             # total target met
+        self.assertEqual(_added(client), 3)                  # total target met
 
     def test_run_per_type_warns_and_ignores_missing_az(self):
         # An --azs entry not present in the region is ignored (warned), the
@@ -805,7 +849,145 @@ class RunPerType(unittest.TestCase):
         with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
             grab_odcr.run(args)
         self.assertEqual({a for _t, a in client.created}, {"us-east-1b"})
-        self.assertEqual(len(client.created), 2)
+        self.assertEqual(_added(client), 2)
+
+
+class GrowableMap(unittest.TestCase):
+    """growable_map(): {(type, az): [crid, count]} of OUR active reservations —
+    the grow targets that let a sweep consolidate instead of creating."""
+
+    def test_maps_tagged_active_reservations(self):
+        from grab_odcr import growable_map
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 3),
+            _reservation("i4i.8xlarge", "us-east-1d", 1),
+        ])
+        m = growable_map(client)
+        self.assertEqual(m[("i4i.16xlarge", "us-east-1b")], ["cr-existing", 3])
+        self.assertEqual(m[("i4i.8xlarge", "us-east-1d")], ["cr-existing", 1])
+
+    def test_ignores_untagged_other_tag_and_non_active(self):
+        from grab_odcr import growable_map
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 1, tag=None),
+            _reservation("i4i.16xlarge", "us-east-1b", 1, tag="other"),
+            _reservation("i4i.16xlarge", "us-east-1d", 1, state="pending"),
+        ])
+        self.assertEqual(growable_map(client), {})
+
+
+class SecureOne(unittest.TestCase):
+    """secure_one(): grow an existing (type, az) reservation by +1, create only
+    when we hold none — the object-count consolidation at the heart of this."""
+
+    def test_grows_existing_instead_of_creating(self):
+        from grab_odcr import secure_one
+        client = FakeEC2([_reservation("i4i.16xlarge", "us-east-1b", 3)])
+        growable = {("i4i.16xlarge", "us-east-1b"): ["cr-existing", 3]}
+        crid = secure_one(client, "i4i.16xlarge", "us-east-1b",
+                          dry_run=False, end_hours=None, growable=growable)
+        self.assertEqual(crid, "cr-existing")
+        self.assertEqual(client.modified, [("cr-existing", 4)])  # absolute 3+1
+        self.assertEqual(client.created, [])                     # no new object
+        # local map bumped so the NEXT grab this sweep grows to 5, not 4 again
+        self.assertEqual(growable[("i4i.16xlarge", "us-east-1b")][1], 4)
+
+    def test_creates_and_registers_when_absent(self):
+        from grab_odcr import secure_one
+        client = FakeEC2()
+        growable = {}
+        crid = secure_one(client, "i4i.16xlarge", "us-east-1b",
+                          dry_run=False, end_hours=None, growable=growable)
+        self.assertEqual(client.created, [("i4i.16xlarge", "us-east-1b")])
+        self.assertEqual(client.modified, [])
+        # registered: the next grab in this same sweep will GROW this crid
+        self.assertEqual(growable[("i4i.16xlarge", "us-east-1b")], [crid, 1])
+
+    def test_reservation_cancelled_elsewhere_falls_back_to_create(self):
+        from grab_odcr import secure_one
+        client = FakeEC2()                      # crid not in fake's store
+        growable = {("i4i.16xlarge", "us-east-1b"): ["cr-gone", 2]}
+        crid = secure_one(client, "i4i.16xlarge", "us-east-1b",
+                          dry_run=False, end_hours=None, growable=growable)
+        self.assertEqual(len(client.created), 1)          # fell back to create
+        self.assertNotEqual(crid, "cr-gone")
+        # stale entry replaced by the fresh reservation
+        self.assertEqual(growable[("i4i.16xlarge", "us-east-1b")], [crid, 1])
+
+    def test_capacity_error_on_grow_propagates_for_classify(self):
+        from grab_odcr import secure_one
+        client = FakeEC2([_reservation("i4i.16xlarge", "us-east-1b", 2)],
+                         no_capacity={"us-east-1b"})
+        growable = {("i4i.16xlarge", "us-east-1b"): ["cr-existing", 2]}
+        with self.assertRaises(ClientError) as ctx:
+            secure_one(client, "i4i.16xlarge", "us-east-1b",
+                       dry_run=False, end_hours=None, growable=growable)
+        from common import classify
+        self.assertEqual(classify(ctx.exception), "capacity")
+        # count NOT bumped — the grow failed
+        self.assertEqual(growable[("i4i.16xlarge", "us-east-1b")][1], 2)
+
+    def test_dry_run_takes_create_path_untouched(self):
+        from grab_odcr import secure_one
+        client = FakeEC2([_reservation("i4i.16xlarge", "us-east-1b", 3)])
+        growable = {("i4i.16xlarge", "us-east-1b"): ["cr-existing", 3]}
+        with self.assertRaises(ClientError):    # DryRunOperation, as before
+            secure_one(client, "i4i.16xlarge", "us-east-1b",
+                       dry_run=True, end_hours=None, growable=growable)
+        self.assertEqual(client.modified, [])   # dry-run never modifies
+        self.assertEqual(growable[("i4i.16xlarge", "us-east-1b")][1], 3)
+
+
+class SweepConsolidates(unittest.TestCase):
+    """The user-facing win: filling an AZ yields ONE reservation object per
+    (type, az) that grows, not a pile of count=1 objects."""
+
+    def setUp(self):
+        self._orig = grab_odcr.record_grab
+        grab_odcr.record_grab = lambda *a, **k: None
+
+    def tearDown(self):
+        grab_odcr.record_grab = self._orig
+
+    def test_watch_fill_produces_one_object_per_type_az(self):
+        cap = 3 * V16
+        held = {}
+        args = _args(per_az_cores=cap, target_cores=2 * cap)
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {("i4i.16xlarge", "us-east-1b"), ("i4i.16xlarge", "us-east-1d")}
+        client = FakeEC2()
+        _drain(client, args, azs, offered, held)
+        # capacity secured is unchanged: 3 instances per AZ...
+        self.assertEqual(held, {"us-east-1b": cap, "us-east-1d": cap})
+        # ...but the account holds exactly ONE reservation object per AZ
+        self.assertEqual(len(client._reservations), 2)
+        counts = sorted((r["AvailabilityZone"], r["TotalInstanceCount"])
+                        for r in client._reservations)
+        self.assertEqual(counts, [("us-east-1b", 3), ("us-east-1d", 3)])
+
+    def test_restart_grows_existing_object_from_aws(self):
+        # after a restart, the sweep must find the PRIOR run's reservation via
+        # AWS and grow IT — not start a second object beside it.
+        client = FakeEC2([_reservation("i4i.16xlarge", "us-east-1d", 2)])
+        cap = 4 * V16
+        held = {"us-east-1d": 2 * V16}     # what run() re-read from AWS
+        args = _args(per_az_cores=cap, target_cores=cap)
+        offered = {("i4i.16xlarge", "us-east-1d")}
+        _drain(client, args, ["us-east-1d"], offered, held)
+        self.assertEqual(held["us-east-1d"], cap)
+        self.assertEqual(client.created, [])              # zero new objects
+        self.assertEqual(len(client._reservations), 1)    # still just one
+        self.assertEqual(client._reservations[0]["TotalInstanceCount"], 4)
+
+    def test_per_type_fill_consolidates_too(self):
+        args = _pt_args({"i4i.16xlarge": 3})
+        offered = {("i4i.16xlarge", "us-east-1b")}
+        held = {}
+        client = FakeEC2()
+        sweep_once_per_type(client, args, ["us-east-1b"], offered, held, [])
+        self.assertEqual(held["i4i.16xlarge"], 3)
+        self.assertEqual(len(client._reservations), 1)    # one object, count=3
+        self.assertEqual(client._reservations[0]["TotalInstanceCount"], 3)
 
 
 if __name__ == "__main__":

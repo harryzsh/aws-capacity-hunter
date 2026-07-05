@@ -3,9 +3,16 @@
 
 Region is configurable via --region (default: us-east-1).
 
-Strategy: sweep AZ x instance-type (large first), CreateCapacityReservation
-count=1 each (all-or-nothing per call, so count=1 scavenges fragments), tag
-each reservation, count vCPUs toward a target, stop at the cap.
+Strategy: sweep AZ x instance-type (large first), securing ONE instance per
+call (all-or-nothing per call, so +1 scavenges fragments), tag each
+reservation, count vCPUs toward a target, stop at the cap.
+
+CONSOLIDATION: the account holds ONE reservation object per (type, AZ). The
+first grab of a (type, AZ) creates it (count=1); every later grab GROWS it by
++1 via ModifyCapacityReservation instead of creating another object. Modify
+has the same capacity semantics as create (needs a free slot in the pool,
+all-or-nothing), so the grab success rate is identical — only the object
+count shrinks: e.g. 156 instances = 1-2 objects, not 156.
 
 WATCH MODE (--watch): loop forever, re-sweeping every --interval seconds.
 Capacity is intermittent, so 24x7 watching is how you actually catch it.
@@ -88,6 +95,71 @@ def reserve_one(client, itype, az, dry_run, end_hours=None):
     else:
         kwargs["EndDateType"] = "unlimited"
     return client.create_capacity_reservation(**kwargs)
+
+
+def growable_map(client):
+    """{(type, az): [crid, count]} of OUR active reservations — grow targets.
+
+    One entry per (type, az): the reservation a sweep should GROW (+1 via
+    ModifyCapacityReservation) instead of creating another count=1 object.
+    Only our tag and only 'active' state qualify (pending/assessing can't be
+    modified). If legacy count=1 piles exist for the same (type, az), the last
+    one listed wins — new capacity consolidates onto it and the others just
+    stay as they are until --cancel-all.
+    """
+    m = {}
+    for crid, itype, az, state, cnt, tag, _avail in list_reservations(client):
+        if tag != TAG_VAL or state != "active":
+            continue
+        m[(itype, az)] = [crid, cnt or 0]
+    return m
+
+
+def secure_one(client, itype, az, dry_run, end_hours=None, growable=None):
+    """Secure ONE instance of (type, az): GROW our existing reservation by +1
+    when we already hold one, CREATE a count=1 reservation only when we don't.
+    Returns the reservation id that now holds the new slot.
+
+    This is what keeps the account at one reservation OBJECT per (type, az)
+    while the grab granularity stays one instance at a time (count=1-equivalent
+    all-or-nothing: ModifyCapacityReservation to count+1 either fully succeeds
+    or changes nothing).
+
+    growable: the {(type, az): [crid, count]} map from growable_map(). Mutated
+        in place on success (count += 1, or a fresh entry after a create) so
+        the map stays accurate WITHIN a sweep between AWS re-reads — same
+        contract as the `held` gates. ModifyCapacityReservation takes an
+        ABSOLUTE count, so an accurate local count is what makes +1 mean +1.
+
+    Grow keeps the reservation's existing EndDate; end_hours only applies to
+    the create path (the object's expiry is set once, at birth).
+
+    dry-run always takes the create path (raises DryRunOperation like before),
+    never calls Modify — the dry-run plan and its classification are unchanged.
+
+    Capacity/throttle errors from EITHER call propagate for classify(); the
+    one error handled here is the growable entry having been cancelled behind
+    our back (NotFound) — drop it and fall back to create.
+    """
+    if growable is None:
+        growable = {}
+    key = (itype, az)
+    if not dry_run and key in growable:
+        crid, cnt = growable[key]
+        try:
+            client.modify_capacity_reservation(
+                CapacityReservationId=crid, InstanceCount=cnt + 1)
+            growable[key][1] = cnt + 1
+            return crid
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code != "InvalidCapacityReservationId.NotFound":
+                raise
+            growable.pop(key, None)
+    resp = reserve_one(client, itype, az, dry_run, end_hours)
+    crid = resp["CapacityReservation"]["CapacityReservationId"]
+    growable[key] = [crid, 1]
+    return crid
 
 
 def list_reservations(client):
@@ -322,7 +394,15 @@ def _az_full(args, held, az):
 
 
 def sweep_once(client, args, azs, offered, held, made):
-    """One full AZ x type pass. Mutates held/made in place."""
+    """One full AZ x type pass. Mutates held/made in place.
+
+    Each grab goes through secure_one: GROW our one reservation per (type, az)
+    by +1 when it exists, create it only the first time — so the account stays
+    at one reservation OBJECT per (type, az) instead of piles of count=1.
+    """
+    # Grow targets, read from AWS once per sweep (live only — dry-run always
+    # takes the create path, so don't spend a describe on it).
+    growable = growable_map(client) if args.live else {}
     priority = args.types or DEFAULT_PRIORITY
     throttle_attempt = 0
     for itype in priority:
@@ -336,8 +416,8 @@ def sweep_once(client, args, azs, offered, held, made):
             if (itype, az) not in offered:
                 continue
             try:
-                resp = reserve_one(client, itype, az, not args.live, args.end_hours)
-                crid = resp["CapacityReservation"]["CapacityReservationId"]
+                crid = secure_one(client, itype, az, not args.live,
+                                  args.end_hours, growable)
                 _on_grab(args, crid, itype, az, held, made)
                 throttle_attempt = 0
             except ClientError as e:
@@ -385,7 +465,11 @@ def sweep_once_per_type(client, args, azs, offered, held, made):
 
     Each type is judged on its OWN target from --per-type: a dry type is simply
     skipped, it never stops the others. No shared core gate, no per-AZ cap.
+
+    Grabs go through secure_one (grow-or-create), same as sweep_once — one
+    reservation OBJECT per (type, az), not piles of count=1.
     """
+    growable = growable_map(client) if args.live else {}
     throttle_attempt = 0
     for itype in args.per_type:
         target = args.per_type[itype]
@@ -399,8 +483,8 @@ def sweep_once_per_type(client, args, azs, offered, held, made):
                 if (itype, az) not in offered:
                     continue
                 try:
-                    resp = reserve_one(client, itype, az, not args.live, args.end_hours)
-                    crid = resp["CapacityReservation"]["CapacityReservationId"]
+                    crid = secure_one(client, itype, az, not args.live,
+                                      args.end_hours, growable)
                     _on_grab_type(args, crid, itype, az, held, made)
                     progressed = True
                     throttle_attempt = 0
