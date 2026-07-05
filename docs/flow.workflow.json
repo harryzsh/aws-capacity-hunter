@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "workflow",
   "meta": {
-    "title": "ODCR Capacity Grabber",
+    "title": "AWS Capacity Hunter",
     "subtitle": "watch 死等 · 按机型台数抢 · grow-or-create 合并预留",
     "output": "flow.html"
   },

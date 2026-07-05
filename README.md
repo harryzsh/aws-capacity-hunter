@@ -1,7 +1,7 @@
-# ec2-i4i-capacity-grabber
+# AWS Capacity Hunter
 
 一个脚本，24×7 死等抢 EC2 容量，给 Prime Day 等大促囤产能。
-**按机型报台数**（如 `i4i.16xlarge:100`），抢的是 **On-Demand 容量预留（ODCR）**：产能锁在你名下，实例停了也不丢，配合客户 ASG 自动吸纳。
+**按机型报台数**（如 `i4i.16xlarge:100`，任何 EC2 机型都行），抢的是 **On-Demand 容量预留（ODCR）**：产能锁在你名下，实例停了也不丢，配合客户 ASG 自动吸纳。
 
 ```bash
 # 演练（不花钱，先看计划）→ 实弹（⚠️ 立刻计费）
@@ -156,7 +156,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ec2-user
-WorkingDirectory=/home/ec2-user/ec2-i4i-capacity-grabber
+WorkingDirectory=/home/ec2-user/aws-capacity-hunter
 ExecStart=/usr/bin/python3 grab_odcr.py --per-type i4i.16xlarge:100 i4i.8xlarge:50 --azs us-east-1b us-east-1d --live --watch --interval 30
 Restart=always
 RestartSec=10
