@@ -118,11 +118,12 @@ def _added(client, itype=None, az=None):
     return len(creates) + len(grows)
 
 
-def _reservation(itype, az, count, tag=TAG_VAL, state="active", available=None):
+def _reservation(itype, az, count, tag=TAG_VAL, state="active", available=None,
+                 crid="cr-existing"):
     # available defaults to count (all free / unused). Pass available<count to
     # simulate a reservation that has instances in it (USED).
     r = {
-        "CapacityReservationId": "cr-existing",
+        "CapacityReservationId": crid,
         "InstanceType": itype,
         "AvailabilityZone": az,
         "State": state,
@@ -407,6 +408,22 @@ class HeldCountByType(unittest.TestCase):
         ])
         self.assertEqual(held_count_by_type(client, {"i4i.16xlarge": 99}),
                          {"i4i.16xlarge": 1})
+
+    def test_only_azs_filters_out_of_scope_stock(self):
+        # The --azs scope bug: targeting only 1b must NOT count 1a's stock,
+        # else 1a inflates the gate and stops the run before 1b gets any.
+        client = FakeEC2([
+            _reservation("i7i.8xlarge", "us-east-1a", 24),   # out of scope
+            _reservation("i7i.8xlarge", "us-east-1b", 3),    # in scope
+        ])
+        # no filter -> counts both AZs
+        self.assertEqual(held_count_by_type(client, {"i7i.8xlarge": 99}),
+                         {"i7i.8xlarge": 27})
+        # scoped to 1b -> 1a's 24 excluded
+        self.assertEqual(
+            held_count_by_type(client, {"i7i.8xlarge": 99},
+                               only_azs={"us-east-1b"}),
+            {"i7i.8xlarge": 3})
 
 
 class GrowableMap(unittest.TestCase):
@@ -728,6 +745,49 @@ class RunPerType(unittest.TestCase):
             grab_odcr.run(args)
         self.assertEqual({a for _t, a in client.created}, {"us-east-1b"})
         self.assertEqual(_added(client), 2)
+
+    def test_out_of_scope_az_stock_does_not_satisfy_target(self):
+        # Hold 24 in 1a, but sweep is locked to 1b with target 5: the 1a
+        # stock must NOT satisfy the gate — exactly 5 land in 1b.
+        client = RunFake(
+            azs=["us-east-1a", "us-east-1b"],
+            reservations=[_reservation("i4i.16xlarge", "us-east-1a", 24,
+                                       crid="cr-1a")])
+        args = self._args({"i4i.16xlarge": 5}, azs=["us-east-1b"])
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(_added(client, az="us-east-1b"), 5)
+        self.assertEqual(_added(client, az="us-east-1a"), 0)  # 1a untouched
+        # 1a's reservation object not modified either
+        one_a = [r for r in client._reservations
+                 if r["AvailabilityZone"] == "us-east-1a"][0]
+        self.assertEqual(one_a["TotalInstanceCount"], 24)
+
+    def test_multi_az_two_odcrs_different_counts_sum_and_grow_correctly(self):
+        # The user's scenario: --azs 1a 1b, one ODCR in each with DIFFERENT
+        # counts (3 in 1a, 1 in 1b), target 5 total. Gate must sum 3+1=4 and
+        # grab exactly ONE more; the grow must go to the right object with
+        # the right absolute count (its own count+1, not the other's).
+        client = RunFake(
+            azs=["us-east-1a", "us-east-1b"],
+            reservations=[
+                _reservation("i7i.8xlarge", "us-east-1a", 3, crid="cr-1a"),
+                _reservation("i7i.8xlarge", "us-east-1b", 1, crid="cr-1b"),
+            ],
+            vcpus={"i7i.8xlarge": 32})
+        args = self._args({"i7i.8xlarge": 5},
+                          azs=["us-east-1a", "us-east-1b"])
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(_added(client), 1)               # 5 - (3+1) = 1
+        self.assertEqual(client.created, [])              # grew, no new object
+        # whichever object grew, it grew to ITS OWN count+1
+        by_id = {r["CapacityReservationId"]: r["TotalInstanceCount"]
+                 for r in client._reservations}
+        self.assertIn(client.modified[0],
+                      [("cr-1a", 4), ("cr-1b", 2)])
+        self.assertEqual(sorted(by_id.values()), sorted([4, 1])
+                         if client.modified[0][0] == "cr-1a" else [3, 2])
 
     def test_absolute_target_already_met_grabs_nothing(self):
         # default (absolute) semantics: hold 24, target 1 -> nothing to do.

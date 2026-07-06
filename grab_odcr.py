@@ -165,13 +165,19 @@ def list_reservations(client):
     return rows
 
 
-def held_count_by_type(client, types):
+def held_count_by_type(client, types, only_azs=None):
     """Sum instances held per type across THIS script's tagged reservations,
-    read LIVE from AWS. Counts INSTANCES (TotalInstanceCount), not reservation
-    objects — one reservation can hold many instances.
+    read LIVE from AWS. Counts INSTANCES (TotalInstanceCount) summed over ALL
+    matching reservation objects — one reservation can hold many instances,
+    and one type can have one object per AZ.
 
     types: the set/dict of types we care about; others are ignored so unrelated
         tagged reservations never inflate a per-type gate.
+
+    only_azs: if given (a set/list of AZ names), count ONLY those AZs. This
+        keeps the stop-gate in scope when you target a subset of AZs: e.g.
+        holding 24 in us-east-1a, `--azs us-east-1b --per-type t:5` must grab
+        5 in 1b — 1a's out-of-scope stock must not satisfy the target.
 
     This is the per-type stop-gate's source of truth. Re-reading it every round
     is what makes restarts safe: after a crash we see exactly how many of each
@@ -180,6 +186,8 @@ def held_count_by_type(client, types):
     held = {}
     for _crid, itype, az, _state, cnt, tag, _avail in list_reservations(client):
         if tag != TAG_VAL or itype not in types:
+            continue
+        if only_azs is not None and az not in only_azs:
             continue
         held[itype] = held.get(itype, 0) + (cnt or 1)
     return held
@@ -463,9 +471,17 @@ def run(args):
     made = []
     # LIVE: seed from AWS so a restart resumes each type where it left off.
     # dry-run: start empty and simulate locally for a clean plan preview.
-    held = held_count_by_type(client, args.per_type) if args.live else {}
+    #
+    # IMPORTANT: count ONLY the AZs we're sweeping (only_azs=set(azs)). If you
+    # target one AZ (--azs us-east-1b) but already hold stock in another
+    # (us-east-1a), that out-of-scope stock would satisfy the gate and stop
+    # the run before the targeted AZ gets anything.
+    scope = set(azs)
+    held = (held_count_by_type(client, args.per_type, only_azs=scope)
+            if args.live else {})
     if args.live and held:
-        log.info("resumed from AWS: already hold %s", held)
+        log.info("resumed from AWS: already hold %s (in target AZs %s)",
+                 held, azs)
 
     # --add: convert "+N more" into an absolute target of held + N, computed
     # ONCE from the AWS truth read above. From here on the normal absolute
@@ -481,8 +497,9 @@ def run(args):
         rounds = 0
         while not _done(held):
             rounds += 1
+            # Re-read AWS truth each round (live), same AZ scope as the seed.
             if args.live:
-                held = held_count_by_type(client, args.per_type)
+                held = held_count_by_type(client, args.per_type, only_azs=scope)
             log.info("--- watch round %d (have %s) ---", rounds,
                      {t: held.get(t, 0) for t in types})
             sweep_once_per_type(client, args, azs, offered, held, made)
