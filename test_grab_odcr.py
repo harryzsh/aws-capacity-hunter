@@ -155,22 +155,25 @@ class PrintListSummary(unittest.TestCase):
         self._p.stop()
         self._tmp.cleanup()
 
-    def test_summary_logs_per_type_instances_and_total(self):
+    def test_summary_logs_account_wide_with_script_share(self):
         client = FakeEC2([
             _reservation("i4i.16xlarge", "us-east-1b", 3),
-            _reservation("i4i.16xlarge", "us-east-1d", 2),   # 16xl total 5
+            _reservation("i4i.16xlarge", "us-east-1d", 2),   # ours: 5
             _reservation("i4i.8xlarge", "us-east-1b", 4),
-            _reservation("i4i.16xlarge", "us-east-1c", 9, tag=None),  # not ours
+            _reservation("i4i.16xlarge", "us-east-1c", 9, tag=None),  # external
         ])
         with self.assertLogs("i4i-grab", level="INFO") as cm:
             print_list(client)
         out = "\n".join(cm.output)
         self.assertIn("i4i.16xlarge", out)
-        self.assertIn("5 instances", out)           # per-type count shown
-        self.assertIn("4 instances", out)
+        # account-wide 16xl = 5 (ours) + 9 (external) = 14, script share 5
+        self.assertIn("14 instances", out)
+        self.assertIn("(5 by script)", out)
+        self.assertIn("4 instances", out)           # 8xl, all by script
+        self.assertIn("(4 by script)", out)
         self.assertIn("TOTAL", out)
-        self.assertIn("9 instances", out)           # 5+4, untagged excluded
-        self.assertIn("across 2 type(s)", out)      # 1c (untagged) not counted
+        self.assertIn("18 instances", out)          # 14 + 4
+        self.assertIn("across 2 type(s)", out)
 
     def test_empty_says_none(self):
         client = FakeEC2([])
@@ -214,8 +217,8 @@ class PrintListSummary(unittest.TestCase):
         out = "\n".join(cm.output)
         self.assertIn("USED", out)                       # per-row + summary label
         self.assertIn("free", out)                       # the unoccupied one
-        # summary counts only OUR tagged: 2 used out of 3
-        self.assertIn("2 / 3 reservations USED", out)
+        # USED tally counts only OUR tagged: 2 used out of 3
+        self.assertIn("2 / 3 script reservations USED", out)
 
     def test_list_auto_reads_targets_from_ledger(self):
         # plain print_list() with NO targets should read per-type targets from
@@ -400,14 +403,28 @@ class HeldCountByType(unittest.TestCase):
         self.assertEqual(held_count_by_type(client, {"i4i.16xlarge": 99}),
                          {"i4i.16xlarge": 3})
 
-    def test_ignores_untagged_and_other_tags(self):
+    def test_default_counts_untagged_and_other_tags_too(self):
+        # DEFAULT: the gate counts every active reservation of the type in
+        # the account — AWS-Assisted / manually created (no tag) included —
+        # so a target is the ACCOUNT total, not just what this script grabbed.
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 3, tag=None),     # external
+            _reservation("i4i.16xlarge", "us-east-1b", 2, tag="other"),  # external
+            _reservation("i4i.16xlarge", "us-east-1b", 1),               # ours
+        ])
+        self.assertEqual(held_count_by_type(client, {"i4i.16xlarge": 99}),
+                         {"i4i.16xlarge": 6})
+
+    def test_only_mine_restricts_to_our_tag(self):
+        # --only-mine: legacy scope — count only this script's tagged stock.
         client = FakeEC2([
             _reservation("i4i.16xlarge", "us-east-1b", 3, tag=None),
             _reservation("i4i.16xlarge", "us-east-1b", 2, tag="other"),
             _reservation("i4i.16xlarge", "us-east-1b", 1),   # ours
         ])
-        self.assertEqual(held_count_by_type(client, {"i4i.16xlarge": 99}),
-                         {"i4i.16xlarge": 1})
+        self.assertEqual(
+            held_count_by_type(client, {"i4i.16xlarge": 99}, only_mine=True),
+            {"i4i.16xlarge": 1})
 
     def test_only_azs_filters_out_of_scope_stock(self):
         # The --azs scope bug: targeting only 1b must NOT count 1a's stock,
@@ -683,7 +700,7 @@ class RunPerType(unittest.TestCase):
     def _args(self, per_type, **over):
         base = dict(region="us-east-1", per_type=dict(per_type), azs=None,
                     live=True, watch=False, interval=0, add=False,
-                    list=False, cancel_all=False)
+                    only_mine=False, list=False, cancel_all=False)
         base.update(over)
         return Namespace(**base)
 
@@ -788,6 +805,46 @@ class RunPerType(unittest.TestCase):
                       [("cr-1a", 4), ("cr-1b", 2)])
         self.assertEqual(sorted(by_id.values()), sorted([4, 1])
                          if client.modified[0][0] == "cr-1a" else [3, 2])
+
+    def test_untagged_stock_counts_toward_target_but_is_never_modified(self):
+        # The customer scenario: AWS-Assisted CRs (42 in 1a, 91 in 1b, no
+        # tag) + target 135. Gate counts 133 held -> grabs exactly 2. The
+        # grabs must CREATE our own tagged objects — never Modify the
+        # untagged ones (they may have another writer; see single-writer).
+        client = RunFake(
+            azs=["us-east-1a", "us-east-1b"],
+            reservations=[
+                _reservation("i7i.8xlarge", "us-east-1a", 42, tag=None,
+                             crid="cr-aws-1a"),
+                _reservation("i7i.8xlarge", "us-east-1b", 91, tag=None,
+                             crid="cr-aws-1b"),
+            ],
+            vcpus={"i7i.8xlarge": 32})
+        args = self._args({"i7i.8xlarge": 135},
+                          azs=["us-east-1a", "us-east-1b"])
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(_added(client), 2)               # 135 - 133 = 2
+        # untagged objects untouched
+        for r in client._reservations:
+            if r["CapacityReservationId"].startswith("cr-aws"):
+                self.assertIn(r["TotalInstanceCount"], (42, 91))
+        self.assertNotIn("cr-aws-1a", [c for c, _n in client.modified])
+        self.assertNotIn("cr-aws-1b", [c for c, _n in client.modified])
+
+    def test_only_mine_flag_ignores_untagged_stock(self):
+        # --only-mine: same account state, but the gate sees 0 held and
+        # grabs the full target.
+        client = RunFake(
+            azs=["us-east-1a"],
+            reservations=[_reservation("i7i.8xlarge", "us-east-1a", 42,
+                                       tag=None, crid="cr-aws-1a")],
+            vcpus={"i7i.8xlarge": 32})
+        args = self._args({"i7i.8xlarge": 3}, azs=["us-east-1a"],
+                          only_mine=True)
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(_added(client), 3)
 
     def test_absolute_target_already_met_grabs_nothing(self):
         # default (absolute) semantics: hold 24, target 1 -> nothing to do.

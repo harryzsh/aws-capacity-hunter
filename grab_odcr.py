@@ -165,14 +165,24 @@ def list_reservations(client):
     return rows
 
 
-def held_count_by_type(client, types, only_azs=None):
-    """Sum instances held per type across THIS script's tagged reservations,
-    read LIVE from AWS. Counts INSTANCES (TotalInstanceCount) summed over ALL
-    matching reservation objects — one reservation can hold many instances,
-    and one type can have one object per AZ.
+def held_count_by_type(client, types, only_azs=None, only_mine=False):
+    """Sum instances held per type, read LIVE from AWS. Counts INSTANCES
+    (TotalInstanceCount) summed over ALL matching reservation objects — one
+    reservation can hold many instances, one type can have objects per AZ.
 
-    types: the set/dict of types we care about; others are ignored so unrelated
-        tagged reservations never inflate a per-type gate.
+    DEFAULT scope is the whole ACCOUNT: every active reservation of the type
+    counts, including ones this script did not create (AWS-Assisted, manual,
+    other tools). So a --per-type target means "the account should hold N of
+    this type in the target AZs" — pre-existing stock satisfies it and the
+    script only tops up the true shortfall. Counting is read-only: reservations
+    without our tag are NEVER modified or cancelled (growable_map/cancel_all
+    stay tag-scoped; see the single-writer constraint).
+
+    only_mine=True restores the legacy scope: count ONLY reservations tagged
+    by this script — a target then means "N GRABBED BY THIS SCRIPT, on top of
+    whatever else exists".
+
+    types: the set/dict of types we care about; others are ignored.
 
     only_azs: if given (a set/list of AZ names), count ONLY those AZs. This
         keeps the stop-gate in scope when you target a subset of AZs: e.g.
@@ -181,11 +191,13 @@ def held_count_by_type(client, types, only_azs=None):
 
     This is the per-type stop-gate's source of truth. Re-reading it every round
     is what makes restarts safe: after a crash we see exactly how many of each
-    type we already hold and only top up the real shortfall — never double-grab.
+    type are already held and only top up the real shortfall — never double-grab.
     """
     held = {}
     for _crid, itype, az, _state, cnt, tag, _avail in list_reservations(client):
-        if tag != TAG_VAL or itype not in types:
+        if itype not in types:
+            continue
+        if only_mine and tag != TAG_VAL:
             continue
         if only_azs is not None and az not in only_azs:
             continue
@@ -276,7 +288,8 @@ def print_list(client, targets=None):
         return
     used_n = 0   # reservations with an instance actually IN them (used > 0)
     ours_n = 0   # our tagged reservations (the denominator)
-    held = {}    # {type: instances} across our tagged reservations
+    held = {}    # {type: instances} account-wide (matches the default gate)
+    mine = {}    # {type: instances} grabbed by this script (our tag)
     for crid, itype, az, state, cnt, tag, avail in rows:
         # USED = is an instance occupying this reservation? (Total - Available)
         total = cnt or 0
@@ -285,26 +298,32 @@ def print_list(client, targets=None):
         used_str = "USED" if used > 0 else "free"
         log.info("%s  %-12s %-12s %-9s count=%s %-4s tag=%s",
                  crid, itype, az, state, cnt, used_str, tag)
+        held[itype] = held.get(itype, 0) + total
         if tag == TAG_VAL:
             ours_n += 1
-            held[itype] = held.get(itype, 0) + total
+            mine[itype] = mine.get(itype, 0) + total
             if used > 0:
                 used_n += 1
     if held:
-        log.info("--- summary (tag=%s) ---", TAG_VAL)
+        # Account-wide per type — the same numbers the grab gate uses by
+        # default — with the script-tagged share broken out per line.
+        log.info("--- summary (account-wide; 'by script' = tag %s) ---", TAG_VAL)
         for itype in sorted(held):
             got = held[itype]
+            by_us = mine.get(itype, 0)
             tgt = targets.get(itype)
             if tgt:
                 flag = "FULL" if got >= tgt else "short"
-                log.info("  %-14s %4d / %d instances [%s]", itype, got, tgt, flag)
+                log.info("  %-14s %4d / %d instances [%s]  (%d by script)",
+                         itype, got, tgt, flag, by_us)
             else:
-                log.info("  %-14s %4d instances", itype, got)
+                log.info("  %-14s %4d instances  (%d by script)",
+                         itype, got, by_us)
         log.info("  %-14s %4d instances  across %d type(s)",
                  "TOTAL", sum(held.values()), len(held))
-        # How many reservations actually have an instance in them.
-        log.info("  %-14s %d / %d reservations USED (have an instance running)",
-                 "USED", used_n, ours_n)
+        # How many of OUR reservations actually have an instance in them.
+        log.info("  %-14s %d / %d script reservations USED (have an instance "
+                 "running)", "USED", used_n, ours_n)
 
 
 def cancel_all(client, dry_run):
@@ -477,11 +496,15 @@ def run(args):
     # (us-east-1a), that out-of-scope stock would satisfy the gate and stop
     # the run before the targeted AZ gets anything.
     scope = set(azs)
-    held = (held_count_by_type(client, args.per_type, only_azs=scope)
+    only_mine = getattr(args, "only_mine", False)
+    held = (held_count_by_type(client, args.per_type, only_azs=scope,
+                               only_mine=only_mine)
             if args.live else {})
     if args.live and held:
-        log.info("resumed from AWS: already hold %s (in target AZs %s)",
-                 held, azs)
+        log.info("already held in target AZs %s: %s (%s)", azs, held,
+                 "our tag only (--only-mine)" if only_mine
+                 else "account-wide, incl. reservations not created by "
+                      "this script — counted, never modified")
 
     # --add: convert "+N more" into an absolute target of held + N, computed
     # ONCE from the AWS truth read above. From here on the normal absolute
@@ -497,9 +520,10 @@ def run(args):
         rounds = 0
         while not _done(held):
             rounds += 1
-            # Re-read AWS truth each round (live), same AZ scope as the seed.
+            # Re-read AWS truth each round (live), same scope as the seed.
             if args.live:
-                held = held_count_by_type(client, args.per_type, only_azs=scope)
+                held = held_count_by_type(client, args.per_type,
+                                          only_azs=scope, only_mine=only_mine)
             log.info("--- watch round %d (have %s) ---", rounds,
                      {t: held.get(t, 0) for t in types})
             sweep_once_per_type(client, args, azs, offered, held, made)
@@ -543,6 +567,15 @@ def main():
                         "(default: every AZ in the region). The per-type COUNT "
                         "is a TOTAL filled across these AZs, wherever there is "
                         "capacity — no per-AZ balancing.")
+    p.add_argument("--only-mine", action="store_true",
+                   help="count ONLY reservations created by this script "
+                        "(tag %s=%s) toward the target. Default counts every "
+                        "active reservation of the type in the account — "
+                        "AWS-Assisted / manually created stock satisfies the "
+                        "target too (counted read-only, never modified or "
+                        "cancelled). With this flag, COUNT means 'N grabbed "
+                        "by this script, on top of whatever else exists'."
+                        % (TAG_KEY, TAG_VAL))
     p.add_argument("--add", action="store_true",
                    help="one-shot manual top-up: each --per-type COUNT means "
                         "'N MORE on top of what I already hold' instead of an "
