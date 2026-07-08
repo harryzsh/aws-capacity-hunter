@@ -17,10 +17,10 @@
 | **EKS 集群名** | `i4i-smoke-eks` | `litellm-cluster` | 名字完全不同；所有命令显式写死集群名，绝不用变量默认值 |
 | **VPC** | **新建专用 VPC**（`10.99.0.0/16`） | 各自独立 | 不复用默认 VPC、不碰生产 VPC，物理隔离 |
 | **资源 tag** | `purpose=i4i-smoke-eks` | — | 所有 create 都打这个 tag；所有 delete 都按这个 tag 过滤 |
-| **ODCR tag** | `primeday-i4i-grab`（脚本默认） | — | `--cancel-all` 只取消这个 tag 的预留 |
+| **ODCR tag** | `capacity-reservation`（脚本默认） | — | `--cancel-all` 只取消这个 tag 的预留 |
 | **IAM/账号** | 同账号 `<ACCOUNT_ID>` | 同账号 | open 预留需同账号——这是唯一共享面，但预留是新建的、tag 独立 |
 
-> ⚠️ **每一条 `delete` / `cancel` 命令执行前，先肉眼确认命令里的集群名是 `i4i-smoke-eks`、tag 是 `i4i-smoke-eks` 或 `primeday-i4i-grab`。** 凡是命令里出现 `litellm` 字样 —— 立刻停手，这不是本测试该碰的东西。
+> ⚠️ **每一条 `delete` / `cancel` 命令执行前，先肉眼确认命令里的集群名是 `i4i-smoke-eks`、tag 是 `i4i-smoke-eks` 或 `capacity-reservation`。** 凡是命令里出现 `litellm` 字样 —— 立刻停手，这不是本测试该碰的东西。
 >
 > ⚠️ 本测试**不使用任何 `--all` / 无过滤的批量删除**。所有清理都按本测试专属 tag 精确删。
 

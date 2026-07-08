@@ -55,7 +55,7 @@ from common import (
 )
 
 TAG_KEY = "purpose"
-TAG_VAL = "primeday-i4i-grab"
+TAG_VAL = "capacity-reservation"
 
 # Logging is ALWAYS on (console + rotating file) — the fallback record of truth.
 log = setup_logging("grab_odcr.log")

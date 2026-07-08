@@ -258,9 +258,9 @@ watch -n 30 'python3 grab_odcr.py --list'    # 持续盯，每 30 秒刷新
 每个「机型 × AZ」一个预留对象、count 随抢占增长，所以列表始终就这么几行。summary 按**机型台数**汇总，自动从台账读上次的目标，显示 `已抢 / 目标` + `FULL/short`：
 
 ```
-cr-0aaa...  i4i.16xlarge  us-east-1b  active  count=78  tag=primeday-i4i-grab
-cr-0bbb...  i4i.16xlarge  us-east-1d  active  count=78  tag=primeday-i4i-grab
---- summary (tag=primeday-i4i-grab) ---
+cr-0aaa...  i4i.16xlarge  us-east-1b  active  count=78  tag=capacity-reservation
+cr-0bbb...  i4i.16xlarge  us-east-1d  active  count=78  tag=capacity-reservation
+--- summary (account-wide; 'by script' = tag capacity-reservation) ---
   i4i.16xlarge    156 / 156 instances [FULL]
   TOTAL           156 instances  across 1 type(s)
   USED            2 / 2 reservations USED (have an instance running)
