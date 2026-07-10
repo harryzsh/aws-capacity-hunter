@@ -28,6 +28,10 @@ def _err(code):
     return ClientError({"Error": {"Code": code, "Message": "x"}}, "Op")
 
 
+def _err_msg(code, message):
+    return ClientError({"Error": {"Code": code, "Message": message}}, "Op")
+
+
 class ResolveAzs(unittest.TestCase):
     ALL = ["us-east-1a", "us-east-1b", "us-east-1c", "us-east-1d"]
 
@@ -266,6 +270,33 @@ class DescribeVcpus(unittest.TestCase):
         client.describe_instance_types.return_value = {"InstanceTypes": []}
         self.assertEqual(describe_vcpus(client, ["nope.nope"]), {})
 
+    def test_invalid_instance_type_error_retries_without_the_bad_name(self):
+        # REAL AWS behavior (unlike the fake above): a nonexistent type name
+        # makes the whole call raise InvalidInstanceType naming the bad types,
+        # failing the valid ones alongside it. describe_vcpus must strip the
+        # named bad types and retry, so one typo ("g7.48xlarge") doesn't kill
+        # the run — it just comes back unresolved while others still resolve.
+        client = mock.Mock()
+        client.describe_instance_types.side_effect = [
+            _err_msg("InvalidInstanceType",
+                     "The following supplied instance types do not exist: "
+                     "[g7.48xlarge]"),
+            {"InstanceTypes": [{"InstanceType": "g7e.48xlarge",
+                                "VCpuInfo": {"DefaultVCpus": 192}}]},
+        ]
+        out = describe_vcpus(client, ["g7.48xlarge", "g7e.48xlarge"])
+        self.assertEqual(out, {"g7e.48xlarge": 192})   # typo absent, valid kept
+        # 2nd call must NOT include the bad name again
+        _, kw2 = client.describe_instance_types.call_args_list[1]
+        self.assertEqual(kw2["InstanceTypes"], ["g7e.48xlarge"])
+
+    def test_all_types_invalid_returns_empty_not_raise(self):
+        client = mock.Mock()
+        client.describe_instance_types.side_effect = _err_msg(
+            "InvalidInstanceType",
+            "The following supplied instance types do not exist: [g7.48xlarge]")
+        self.assertEqual(describe_vcpus(client, ["g7.48xlarge"]), {})
+
 
 class EnsureVcpu(unittest.TestCase):
     """ensure_vcpu(): enrich the in-memory VCPU table for any requested types
@@ -331,6 +362,24 @@ class EnsureVcpu(unittest.TestCase):
         ensure_vcpu(client, ["m7i.large", "m7i.large"])
         _, kwargs = client.describe_instance_types.call_args
         self.assertEqual(kwargs["InstanceTypes"], ["m7i.large"])
+
+    def test_invalid_type_reported_unresolved_not_raised(self):
+        # A typo'd type ("g7.48xlarge") makes real AWS raise
+        # InvalidInstanceType; ensure_vcpu must report it as unresolvable and
+        # still learn the valid one — never propagate the error to the caller.
+        client = mock.Mock()
+        client.describe_instance_types.side_effect = [
+            _err_msg("InvalidInstanceType",
+                     "The following supplied instance types do not exist: "
+                     "[g7.48xlarge]"),
+            {"InstanceTypes": [{"InstanceType": "g7e.48xlarge",
+                                "VCpuInfo": {"DefaultVCpus": 192}}]},
+        ]
+        added, unresolved = ensure_vcpu(client, ["g7.48xlarge", "g7e.48xlarge"])
+        self.assertEqual(added, {"g7e.48xlarge": 192})
+        self.assertEqual(unresolved, ["g7.48xlarge"])
+        self.assertIn("g7e.48xlarge", common.VCPU)
+        self.assertNotIn("g7.48xlarge", common.VCPU)
 
 
 if __name__ == "__main__":

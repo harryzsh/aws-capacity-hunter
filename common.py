@@ -4,6 +4,7 @@ grab_odcr.py imports from here.
 Region is configurable via --region (default: us-east-1).
 """
 import os
+import re
 import json
 import time
 import random
@@ -117,6 +118,21 @@ def ec2_client(region=DEFAULT_REGION):
     return boto3.client("ec2", region_name=region)
 
 
+# AWS names the offending types in the InvalidInstanceType message, e.g.
+# "The following supplied instance types do not exist: [g7.48xlarge, x.y]".
+_BAD_TYPE_RE = re.compile(r"\[([^\]]*)\]")
+
+
+def _bad_types_from_error(err):
+    """Extract the instance-type names AWS flagged in an InvalidInstanceType
+    error message. Returns a set (empty if the message can't be parsed)."""
+    msg = err.response.get("Error", {}).get("Message", "")
+    m = _BAD_TYPE_RE.search(msg)
+    if not m:
+        return set()
+    return {t.strip() for t in m.group(1).split(",") if t.strip()}
+
+
 def describe_vcpus(client, types):
     """Ask AWS the DefaultVCpus for each instance type in `types`.
 
@@ -124,26 +140,45 @@ def describe_vcpus(client, types):
     not know are simply absent from the result (the caller decides what to do
     with the gap). Paginates via NextToken. No API call for an empty list.
 
+    Nonexistent type names: real EC2 does NOT return them as "missing" — it
+    fails the WHOLE DescribeInstanceTypes call with InvalidInstanceType,
+    naming the bad types in the message. We parse those names out, drop them,
+    and retry with the survivors, so one typo (`g7.48xlarge`) can't kill a run
+    that also asked for valid types — the typo just ends up absent from the
+    result (reported as unresolvable by ensure_vcpu). If every requested type
+    is bad, the retry set is empty and we return {}.
+
     This is what lets the grabber target ANY instance type instead of only the
     families baked into the static VCPU table.
     """
     types = list(types)
-    if not types:
-        return {}
     out = {}
-    token = None
-    while True:
-        kwargs = {"InstanceTypes": types}
-        if token:
-            kwargs["NextToken"] = token
-        resp = client.describe_instance_types(**kwargs)
-        for it in resp.get("InstanceTypes", []):
-            vcpu = it.get("VCpuInfo", {}).get("DefaultVCpus")
-            if vcpu is not None:
-                out[it["InstanceType"]] = vcpu
-        token = resp.get("NextToken")
-        if not token:
-            break
+    while types:
+        token = None
+        try:
+            while True:
+                kwargs = {"InstanceTypes": types}
+                if token:
+                    kwargs["NextToken"] = token
+                resp = client.describe_instance_types(**kwargs)
+                for it in resp.get("InstanceTypes", []):
+                    vcpu = it.get("VCpuInfo", {}).get("DefaultVCpus")
+                    if vcpu is not None:
+                        out[it["InstanceType"]] = vcpu
+                token = resp.get("NextToken")
+                if not token:
+                    break
+            return out
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "InvalidInstanceType":
+                raise
+            bad = _bad_types_from_error(e)
+            survivors = [t for t in types if t not in bad]
+            # No parsable bad names, or nothing left to retry -> give up on
+            # the rest (they're all unresolvable). Return whatever resolved.
+            if not bad or not survivors or survivors == types:
+                return out
+            types = survivors
     return out
 
 
