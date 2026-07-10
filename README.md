@@ -40,6 +40,15 @@ python3 grab_odcr.py --per-type i4i.16xlarge:156 --azs us-east-1b us-east-1d --l
 
 每次抢到一台时：该 (机型 × AZ) **已有**我们 tag 的 active 预留 → `ModifyCapacityReservation` 把它的 count **+1**；**没有** → `CreateCapacityReservation` 新建 count=1。Modify 和 Create 的容量语义完全一样（需要池子里有空位、全有或全无），所以**抢占粒度和成功率不变**，只是对象数收敛：每个机型 × AZ 恒为一个对象。
 
+### 所有权 = tag `purpose=capacity-reservation`
+
+脚本给自己建的每个预留打这个 tag，它是「这是本脚本的预留」的**唯一凭证**——加量往哪长、`--cancel-all` 释放哪些、`--list` 的 by-script 份额，全按它判断（实时读，无缓存）。
+
+- **别手动删这个 tag**。删了预留不会消失、照常计费，但脚本从此不认它：不再往上面加量（会另建新对象）、**`--cancel-all` 不再释放它**——大促结束跑完释放你以为清零了，它还在偷偷烧钱（「孤儿预留」）。误删了用 `aws ec2 create-tags --resources cr-xxxx --tags Key=purpose,Value=capacity-reservation` 打回去，下一秒恢复认领。
+- 反过来这也是个功能：想让某个预留**脱离**脚本管理（留作他用、不随 cancel-all 释放），删 tag 就是正式的「除名」。
+- 想让脚本**认领**一个别处建的预留（老版本 tag、手动建的），同样打上这个 tag 即可——认领前确认没有别的流程还在管理它（单写者），并接受它会随 `--cancel-all` 一起释放。
+- tag 值是写死的常量：**不区分批次**。今天抢的和上个月抢的同一个 tag，`--cancel-all` 一锅端，没有「只释放这一批」的能力。
+
 ### 红线一：单写者约束 ⚠️
 
 `ModifyCapacityReservation` 传的是**绝对台数**（不是「+1」增量）。脚本按「每轮从 AWS 重读真值 + 轮内本地累加」计算下一个数，所以对**同一 region 里本脚本 tag 的预留，写者必须只有一个**。满足这一条，数量只增不减、数学上不可能变少。
@@ -211,7 +220,8 @@ python3 grab_odcr.py --cancel-all --live
 ```
 
 > 顺序不能反：先 `stop` 防止「边释放边又抢回来」，再 `cancel-all`。
-> 跑完用 `--list` 确认预留已清零、不再计费。
+> 跑完用 `--list` 确认：**by script 份额清零**；同机型如果还有无 tag 的行，逐个确认是不是该留的（`--cancel-all` 只释放本脚本 tag 的预留——tag 被误删过的「孤儿」不会被释放，会继续计费）。
+> **在多个 region 抢过的，每个 region 都要单独跑一遍 `--cancel-all --live --region <R>`。**
 
 ### 最小 IAM 权限
 
@@ -257,18 +267,22 @@ python3 grab_odcr.py --list
 watch -n 30 'python3 grab_odcr.py --list'    # 持续盯，每 30 秒刷新
 ```
 
-每个「机型 × AZ」一个预留对象、count 随抢占增长，所以列表始终就这么几行。summary 按**机型台数**汇总，自动从台账读上次的目标，显示 `已抢 / 目标` + `FULL/short`：
+每个「机型 × AZ」一个预留对象、count 随抢占增长，所以列表始终就这么几行。summary 按**机型台数**、**账号全量**口径汇总（和抢占闸门同口径，含非本脚本的预留），每行括号里单独给出本脚本抢到的份额；目标自动从台账读，显示 `已抢 / 目标` + `FULL/short`：
 
 ```
-cr-0aaa...  i4i.16xlarge  us-east-1b  active  count=78  tag=capacity-reservation
-cr-0bbb...  i4i.16xlarge  us-east-1d  active  count=78  tag=capacity-reservation
+cr-0aws...  i4i.16xlarge  us-east-1a  active  count=42   USED tag=            ← 别处建的（external）
+cr-0aaa...  i4i.16xlarge  us-east-1b  active  count=78   free tag=capacity-reservation
+cr-0bbb...  i4i.16xlarge  us-east-1d  active  count=78   free tag=capacity-reservation
 --- summary (account-wide; 'by script' = tag capacity-reservation) ---
-  i4i.16xlarge    156 / 156 instances [FULL]
-  TOTAL           156 instances  across 1 type(s)
-  USED            2 / 2 reservations USED (have an instance running)
+  i4i.16xlarge    198 / 198 instances [FULL]  (156 by script)
+  TOTAL           198 instances  across 1 type(s)
+  USED            0 / 2 script reservations USED (have an instance running)
 ```
+
+**怎么读**：大数字（198）= 账号总持有，进度按它算；括号（156 by script）= 本脚本抢到的份额；没 tag 的行是别处建的（AWS 协助/手动），只计数、脚本绝不修改或释放。
 
 > 台账里没目标（全新环境）时，summary 退回纯台数（不带 `/ 目标` 和 `FULL/short`）。
+> **`--cancel-all` 之后必看**：script 份额应清零；如果还有同机型、没 tag 的行，确认它们是不是该留的（误删过 tag 的「孤儿预留」会以无 tag 行的样子继续计费）。
 
 ### ② 脚本此刻在干啥 —— 运行日志
 
